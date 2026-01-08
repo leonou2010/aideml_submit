@@ -48,6 +48,24 @@ class Node(DataClassJsonMixin):
     # -> always True if exc_type is not None or no valid metric
     is_buggy: bool = field(default=None, kw_only=True)  # type: ignore
 
+    # ---- standardized metrics (optional; used for post-search selection and logging) ----
+    valid_metric: float | None = field(default=None, kw_only=True)
+
+    cv_mean: float | None = field(default=None, kw_only=True)
+    cv_std: float | None = field(default=None, kw_only=True)
+    cv_folds: list[float] | None = field(default=None, kw_only=True)
+
+    submission_csv_path: str | None = field(default=None, kw_only=True)
+    submission_csv_sha256: str | None = field(default=None, kw_only=True)
+
+    # ---- progressive complexity metadata (optional; prompt-based) ----
+    progressive_stage: str | None = field(default=None, kw_only=True)  # exploration|refinement|validation
+    data_fraction_used: float | None = field(default=None, kw_only=True)
+    hparam_tuning_enabled: bool | None = field(default=None, kw_only=True)
+
+    # ---- timing metadata (optional) ----
+    cumulative_exec_time: float | None = field(default=None, kw_only=True)
+
     def __post_init__(self) -> None:
         if self.parent is not None:
             self.parent.children.add(self)

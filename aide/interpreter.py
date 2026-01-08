@@ -95,6 +95,7 @@ class Interpreter:
         timeout: int = 3600,
         format_tb_ipython: bool = False,
         agent_file_name: str = "runfile.py",
+        num_threads: int | None = None,
     ):
         """
         Simulates a standalone Python REPL with an execution time limit.
@@ -113,9 +114,24 @@ class Interpreter:
         self.timeout = timeout
         self.format_tb_ipython = format_tb_ipython
         self.agent_file_name = agent_file_name
+        self.num_threads = int(num_threads) if num_threads is not None else None
         self.process: Process = None  # type: ignore
 
     def child_proc_setup(self, result_outq: Queue) -> None:
+        # Best-effort thread caps for compute safety (must be set before ML libs import).
+        if self.num_threads is not None and self.num_threads > 0:
+            cap = str(self.num_threads)
+            os.environ.setdefault("AIDE_NUM_THREADS", cap)
+            os.environ.setdefault("OMP_NUM_THREADS", cap)
+            os.environ.setdefault("MKL_NUM_THREADS", cap)
+            os.environ.setdefault("OPENBLAS_NUM_THREADS", cap)
+            os.environ.setdefault("BLIS_NUM_THREADS", cap)
+            os.environ.setdefault("VECLIB_MAXIMUM_THREADS", cap)
+            # Library-specific hints (may or may not be honored depending on code/library).
+            os.environ.setdefault("CATBOOST_THREAD_COUNT", cap)
+            os.environ.setdefault("XGBOOST_NUM_THREADS", cap)
+            os.environ.setdefault("LIGHTGBM_NUM_THREADS", cap)
+
         # disable all warnings (before importing anything)
         import shutup
 
@@ -296,7 +312,8 @@ class Interpreter:
                 output.append(self.result_outq.get(timeout=1))
             except queue.Empty:
                 continue
-        output.pop()  # remove the EOF marker
+        if output and output[-1] == "<|EOF|>":
+            output.pop()  # remove the EOF marker
 
         e_cls_name, exc_info, exc_stack = state[1:]
 

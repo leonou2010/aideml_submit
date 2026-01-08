@@ -19,7 +19,8 @@ def copytree(src: Path, dst: Path, use_symlinks=True):
 
     if src.is_file():
         dest_f = dst / src.name
-        assert not dest_f.exists(), dest_f
+        if dest_f.exists():
+            return
         if use_symlinks:
             (dest_f).symlink_to(src)
         else:
@@ -28,7 +29,10 @@ def copytree(src: Path, dst: Path, use_symlinks=True):
 
     for f in src.iterdir():
         dest_f = dst / f.name
-        assert not dest_f.exists(), dest_f
+        if dest_f.exists():
+            if f.is_dir() and dest_f.is_dir() and not use_symlinks:
+                copytree(f, dest_f, use_symlinks=use_symlinks)
+            continue
         if use_symlinks:
             (dest_f).symlink_to(f)
         elif f.is_dir():

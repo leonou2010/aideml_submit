@@ -1,6 +1,10 @@
 import atexit
 import logging
+import os
+import random
 import shutil
+
+import numpy as np
 
 from . import backend
 
@@ -24,7 +28,7 @@ from rich.progress import (
 from rich.text import Text
 from rich.status import Status
 from rich.tree import Tree
-from .utils.config import load_task_desc, prep_agent_workspace, save_run, load_cfg
+from .utils.config import load_task_desc, prep_agent_workspace, save_run, load_cfg, export_final_submissions
 
 logger = logging.getLogger("aide")
 
@@ -33,15 +37,23 @@ def journal_to_rich_tree(journal: Journal):
     best_node = journal.get_best_node()
 
     def append_rec(node: Node, tree):
+        node_num = getattr(node, 'step', '?')
         if node.is_buggy:
-            s = "[red]◍ bug"
+            s = f"[red]#{node_num} ◍ bug"
         else:
             style = "bold " if node is best_node else ""
 
-            if node is best_node:
-                s = f"[{style}green]● {node.metric.value:.3f} (best)"
+            # Include cv_std if available
+            cv_std = getattr(node, 'cv_std', None)
+            if cv_std is not None and cv_std > 0:
+                std_str = f"±{cv_std:.3f}"
             else:
-                s = f"[{style}green]● {node.metric.value:.3f}"
+                std_str = ""
+
+            if node is best_node:
+                s = f"[{style}green]#{node_num} ● {node.metric.value:.3f}{std_str} (best)"
+            else:
+                s = f"[{style}green]#{node_num} ● {node.metric.value:.3f}{std_str}"
 
         subtree = tree.add(s)
         for child in node.children:
@@ -57,6 +69,17 @@ def run():
     cfg = load_cfg()
     logger.info(f'Starting run "{cfg.exp_name}"')
 
+    global_step = 0
+
+    seed_env = os.environ.get("AIDE_SEED")
+    if seed_env is not None:
+        try:
+            seed = int(seed_env)
+        except ValueError:
+            raise ValueError(f"Invalid AIDE_SEED={seed_env!r}; expected an int.")
+        random.seed(seed)
+        np.random.seed(seed)
+
     task_desc = load_task_desc(cfg)
     task_desc_str = backend.compile_prompt_to_md(task_desc)
 
@@ -69,7 +92,17 @@ def run():
 
     atexit.register(cleanup)
 
-    journal = Journal()
+    # Try to resume from existing journal if it exists
+    journal_path = cfg.log_dir / "journal.json"
+    if journal_path.exists():
+        from .utils import serialize
+        print(f"[Resume] Found existing journal at {journal_path}")
+        journal = serialize.load_json(journal_path, Journal)
+        print(f"[Resume] Loaded {len(journal)} existing nodes, continuing from step {len(journal)}")
+    else:
+        journal = Journal()
+        print(f"[New Run] Starting fresh journal")
+
     agent = Agent(
         task_desc=task_desc,
         cfg=cfg,
@@ -134,6 +167,10 @@ def run():
             global_step = len(journal)
             live.update(generate_live())
     interpreter.cleanup_session()
+
+    # Export final submissions
+    print("\nExporting final submissions...")
+    export_final_submissions(cfg, journal)
 
     if cfg.generate_report:
         print("Generating final report from journal...")
