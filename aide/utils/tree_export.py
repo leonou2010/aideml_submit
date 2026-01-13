@@ -81,14 +81,24 @@ def cfg_to_tree_struct(cfg, jou: Journal):
     for n in jou:
         maximize = getattr(getattr(n, "metric", None), "maximize", None)
         metric_maximize.append(maximize)
-        is_buggy.append(bool(getattr(n, "is_buggy", False)))
+        node_is_buggy = bool(getattr(n, "is_buggy", False))
+        is_buggy.append(node_is_buggy)
 
         raw_metric = getattr(getattr(n, "metric", None), "value", None)
-        metrics.append(float(raw_metric) if isinstance(raw_metric, (int, float)) else 0.0)
+        # Visualization sizing uses `1 - metrics[i]` as a relative-size signal.
+        # For buggy / missing-metric nodes, use 1.0 so they render as the minimum size.
+        metrics.append(float(raw_metric) if isinstance(raw_metric, (int, float)) else 1.0)
 
         cv_mean = getattr(n, "cv_mean", None)
         cv_std = getattr(n, "cv_std", None)
         cv_folds = getattr(n, "cv_folds", None)
+
+        # Do not display scores for buggy nodes (debug nodes, timeouts, exceptions, etc.).
+        if node_is_buggy:
+            cv_std_values.append(None)
+            cv_folds_values.append(None)
+            metric_values.append("N/A")
+            continue
 
         cv_std_values.append(cv_std if isinstance(cv_std, (int, float)) else None)
         cv_folds_values.append(cv_folds if isinstance(cv_folds, list) else None)
@@ -108,7 +118,7 @@ def cfg_to_tree_struct(cfg, jou: Journal):
                 metric_values.append("N/A")
 
     # Selection summary: baseline (best_valid), configured post-search selector, and additional robust selectors.
-    best_raw = jou.get_best_node(only_good=False)
+    best_raw = jou.get_best_node(only_good=True)
     post_sel, post_info = select_final_node_with_info(
         jou,
         selection=getattr(cfg.post_search, "selection", "best_valid"),
@@ -118,7 +128,7 @@ def cfg_to_tree_struct(cfg, jou: Journal):
         elite_top_k=getattr(cfg.post_search, "elite_top_k", 3),
         elite_ratio=getattr(cfg.post_search, "elite_ratio", 0.05),
         elite_k_std=getattr(cfg.post_search, "elite_k_std", 2.0),
-        only_good=False,
+        only_good=True,
     )
 
     mean_sel, mean_info = select_final_node_with_info(
@@ -126,7 +136,7 @@ def cfg_to_tree_struct(cfg, jou: Journal):
         selection="mean_minus_k_std",
         top_k=getattr(cfg.post_search, "top_k", 20),
         k_std=getattr(cfg.post_search, "k_std", 2.0),
-        only_good=False,
+        only_good=True,
     )
 
     maxmin_nf_sel, maxmin_nf_info = select_final_node_with_info(
@@ -134,7 +144,7 @@ def cfg_to_tree_struct(cfg, jou: Journal):
         selection="maximin_no_filter",
         top_k=getattr(cfg.post_search, "top_k", 20),
         guard_std=getattr(cfg.post_search, "guard_std", 2.0),
-        only_good=False,
+        only_good=True,
     )
 
     return dict(

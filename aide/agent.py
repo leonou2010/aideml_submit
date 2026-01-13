@@ -1,7 +1,9 @@
+import hashlib
 import logging
 import math
 import random
 import re
+from pathlib import Path
 from typing import Any, Callable, cast
 
 import humanize
@@ -192,6 +194,7 @@ class Agent:
             "No parts of the code should be skipped, don't terminate the before finishing the script.",
             "Your response should only contain a single code block.",
             f"Be aware of the running time of the code, it should complete within {humanize.naturaldelta(self.cfg.exec.timeout)}.",
+            "DO NOT use GridSearchCV or RandomizedSearchCV.",
             "Compute safety: avoid unconstrained parallelism. Do NOT use `n_jobs=-1` anywhere. If you set `n_jobs` / `thread_count` / `num_threads`, cap them to `int(os.getenv('AIDE_NUM_THREADS', '{n}'))` (use the same cap consistently).".format(
                 n=int(getattr(self.cfg.exec, "num_threads", 4) or 4)
             ),
@@ -290,7 +293,7 @@ class Agent:
 
         prompt["Instructions"] |= self._prompt_resp_fmt
         sketch_guideline = [
-            "Keep the initial solution design relatively simple and robust; follow the Stage Instructions for subsampling, CV folds, and hyperparameter tuning.",
+            "Keep the initial solution design relatively simple and robust; follow the Stage Instructions for subsampling, and CV folds.",
             "Take the Memory section into consideration when proposing the design,"
             " don't propose the same modelling solution but keep the evaluation the same.",
             "Do not subsample the dataset in draft runs; always use the full training data.",
@@ -370,9 +373,11 @@ class Agent:
         active_trials = ""
         if self.bug_consultant:
             try:
+                # Use full output (not truncated) for better bug matching
+                full_error_msg = "".join(parent_node._term_out) if hasattr(parent_node, "_term_out") else parent_node.term_out
                 retrieval = self.bug_consultant.retrieve_relevant_context(
                     current_error_type=parent_node.exc_type or "Unknown",
-                    current_error_msg=parent_node.term_out,
+                    current_error_msg=full_error_msg,
                     current_code=parent_node.code,
                     original_plan=parent_node.plan or "",
                 )
@@ -682,9 +687,42 @@ class Agent:
                 node.analysis = f"[CV VALIDATION ERROR] {cv_validation_error}"
             logger.error(f"Node {node.step} marked as buggy due to invalid cv_folds")
 
-        # No CV folds found at all - use single validation score as fallback
-        if node.cv_folds is None and cv_validation_error is None:
-            node.cv_mean = node.valid_metric  # Single holdout validation score
-            node.cv_std = None  # No variance information available
-            if node.cv_mean is not None:
-                logger.info(f"No CV folds found, using single validation metric: {node.cv_mean:.6f}")
+        # STRICT ENFORCEMENT: cv_folds is the SOURCE OF TRUTH
+        # Mark node as buggy if no valid cv_folds found (no fallback to single validation)
+        if node.cv_folds is None:
+            node.is_buggy = True
+            node.metric = WorstMetricValue()
+            error_msg = (
+                "Missing CV folds: The code did not report cross-validation fold scores. "
+                f"Expected {self.acfg.k_fold_validation}-fold CV with all fold scores in cv_folds list. "
+                "Ensure the code prints AIDE_METRICS_JSON with cv_folds=[...] containing all fold scores."
+            )
+            if node.analysis:
+                node.analysis = f"[MISSING CV FOLDS] {error_msg}\n\nOriginal analysis: {node.analysis}"
+            else:
+                node.analysis = f"[MISSING CV FOLDS] {error_msg}"
+            # Set cv_mean/cv_std to None to make it clear there's no valid CV data
+            node.cv_mean = None
+            node.cv_std = None
+            logger.error(f"Node {node.step} marked as buggy due to missing cv_folds")
+
+        # Save submission.csv immediately after execution (before it gets overwritten by next node)
+        if hasattr(self.cfg, "export") and self.cfg.export.save_submissions:
+            submission_src = Path(self.cfg.workspace_dir) / "working" / "submission.csv"
+            if submission_src.exists():
+                solutions_dir = Path(self.cfg.log_dir) / "solutions"
+                solutions_dir.mkdir(parents=True, exist_ok=True)
+                submission_dst = solutions_dir / f"submission_node_{node.step}.csv"
+                if not submission_dst.exists():
+                    submission_dst.write_bytes(submission_src.read_bytes())
+                    try:
+                        node.submission_csv_path = str(submission_dst)
+                        # Calculate SHA256 hash
+                        h = hashlib.sha256()
+                        with open(submission_dst, "rb") as f:
+                            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                                h.update(chunk)
+                        node.submission_csv_sha256 = h.hexdigest()
+                        logger.info(f"Saved submission.csv for node {node.step} to {submission_dst}")
+                    except Exception as e:
+                        logger.warning(f"Failed to set submission metadata for node {node.step}: {e}")

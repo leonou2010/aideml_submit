@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+import json
 import jsonschema
 from dataclasses_json import DataClassJsonMixin
 import backoff
@@ -43,8 +44,30 @@ def opt_messages_to_list(
 def compile_prompt_to_md(prompt: PromptType, _header_depth: int = 1) -> str:
     if isinstance(prompt, str):
         return prompt.strip() + "\n"
+    elif prompt is None:
+        return "null\n"
+    elif isinstance(prompt, (int, float, bool)):
+        return f"{prompt}\n"
     elif isinstance(prompt, list):
-        return "\n".join([f"- {s.strip()}" for s in prompt] + ["\n"])
+        lines: list[str] = []
+        for item in prompt:
+            if item is None:
+                lines.append("- null")
+            elif isinstance(item, str):
+                lines.append(f"- {item.strip()}")
+            elif isinstance(item, (int, float, bool)):
+                lines.append(f"- {item}")
+            elif isinstance(item, (dict, list)):
+                try:
+                    blob = json.dumps(item, indent=2, ensure_ascii=False)
+                except Exception:
+                    blob = str(item)
+                lines.extend(["- ```json", blob, "```"])
+            else:
+                lines.append(f"- {str(item).strip()}")
+        return "\n".join(lines + ["\n"])
+    elif not isinstance(prompt, dict):
+        return str(prompt).strip() + "\n"
 
     out = []
     header_prefix = "#" * _header_depth

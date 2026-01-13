@@ -32,7 +32,7 @@ exec:
 generate_report: True
 # LLM settings for final report from journal
 report:
-  model: gpt-4.1
+  model: gpt-4o
   temp: 1.0
 
 # agent hyperparams
@@ -48,12 +48,12 @@ agent:
 
   # LLM settings for coding
   code:
-    model: o4-mini
+    model: gpt-4o
     temp: 0.5
 
   # LLM settings for evaluating program output / tracebacks
   feedback:
-    model: gpt-4.1-mini
+    model: gpt-4o
     temp: 0.5
 
   # hyperparameters for the tree search
@@ -83,7 +83,7 @@ progressive:
   exploration:
     data_fraction: 1.0
     disable_hparam_tuning: true
-    max_cv_folds: 3
+    max_cv_folds: 5
     subsample_method: stratified
     hparam_iter_limit: null
 
@@ -134,3 +134,18 @@ export:
   save_submissions: true
   save_metrics_table: true
   save_final_selection: true
+
+# per-step grading with MLE-bench (for generalization gap experiments)
+per_step_grading:
+  enabled: false
+  mlebench_data_dir: /home/ka3094/mle-bench/data/competitions
+  methods:
+    - best_valid
+    - mean_minus_k_std
+    - maximin
+    - elite_maximin
+  grade_every_n_steps: 1
+  save_every_n_steps: 1  # Save CSV/JSON every N steps for live monitoring
+
+# Optional competition ID (for per-step grading)
+competition_id: null

@@ -120,17 +120,34 @@ class Interpreter:
     def child_proc_setup(self, result_outq: Queue) -> None:
         # Best-effort thread caps for compute safety (must be set before ML libs import).
         if self.num_threads is not None and self.num_threads > 0:
-            cap = str(self.num_threads)
-            os.environ.setdefault("AIDE_NUM_THREADS", cap)
-            os.environ.setdefault("OMP_NUM_THREADS", cap)
-            os.environ.setdefault("MKL_NUM_THREADS", cap)
-            os.environ.setdefault("OPENBLAS_NUM_THREADS", cap)
-            os.environ.setdefault("BLIS_NUM_THREADS", cap)
-            os.environ.setdefault("VECLIB_MAXIMUM_THREADS", cap)
+            cap_int = int(self.num_threads)
+            cap = str(cap_int)
+
+            def _cap_env(name: str) -> None:
+                cur = os.environ.get(name)
+                if not cur:
+                    os.environ[name] = cap
+                    return
+                try:
+                    if int(cur) > cap_int:
+                        os.environ[name] = cap
+                except Exception:
+                    os.environ[name] = cap
+
+            # Core thread caps
+            _cap_env("AIDE_NUM_THREADS")
+            _cap_env("OMP_NUM_THREADS")
+            _cap_env("MKL_NUM_THREADS")
+            _cap_env("OPENBLAS_NUM_THREADS")
+            _cap_env("BLIS_NUM_THREADS")
+            _cap_env("VECLIB_MAXIMUM_THREADS")
+            _cap_env("NUMEXPR_NUM_THREADS")
+            _cap_env("LOKY_MAX_CPU_COUNT")  # joblib/loky (limits n_jobs=-1)
+
             # Library-specific hints (may or may not be honored depending on code/library).
-            os.environ.setdefault("CATBOOST_THREAD_COUNT", cap)
-            os.environ.setdefault("XGBOOST_NUM_THREADS", cap)
-            os.environ.setdefault("LIGHTGBM_NUM_THREADS", cap)
+            _cap_env("CATBOOST_THREAD_COUNT")
+            _cap_env("XGBOOST_NUM_THREADS")
+            _cap_env("LIGHTGBM_NUM_THREADS")
 
         # disable all warnings (before importing anything)
         import shutup

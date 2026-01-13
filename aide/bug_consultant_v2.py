@@ -713,7 +713,8 @@ class BugConsultant:
         """
         if not current_node:
             return ""
-        if not self.bug_records:
+        # Check BOTH completed and active bugs - active bugs show what didn't work!
+        if not self.bug_records and not self.active_bugs:
             return "No historical bugs to learn from yet."
 
         try:
@@ -738,14 +739,22 @@ class BugConsultant:
 
         This is a compact, prompt-safe view; detailed context should come from `get_guidance()`.
         """
-        if not self.bug_records:
+        # Include BOTH completed and active bugs for early-run guidance
+        if not self.bug_records and not self.active_bugs:
             return ""
 
         lessons = []
-        # Most recent first
+        # Most recent first - include completed bugs
         for record in sorted(self.bug_records.values(), key=lambda r: r.timestamp, reverse=True):
             if record.lesson:
                 lessons.append(f"- {record.error_type}: {record.lesson}")
+
+        # Also include lessons from active bugs (what's currently failing)
+        for record in sorted(self.active_bugs.values(), key=lambda r: r.timestamp, reverse=True):
+            if record.failed_strategies:
+                # Show what's NOT working for active bugs
+                for strategy in record.failed_strategies[:2]:  # Top 2 failed strategies per active bug
+                    lessons.append(f"- {record.error_type} [ACTIVE]: Avoid: {strategy}")
 
         if not lessons:
             return ""
@@ -909,7 +918,7 @@ class BugConsultant:
 
             return {
                 "why_worked": why_worked,
-                "successful_strategy_summary": strategy[:500],
+                "successful_strategy_summary": strategy[:5000],
                 "key_insight": f"Approach resolved {record.error_type}",
             }
 

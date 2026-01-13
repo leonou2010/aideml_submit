@@ -3,13 +3,14 @@ import logging
 import os
 import random
 import shutil
+import time
 
 import numpy as np
 
 from . import backend
 
 from .agent import Agent
-from .interpreter import Interpreter
+from .interpreter import ExecutionResult, Interpreter
 from .journal import Journal, Node
 from .journal2report import journal2report
 from omegaconf import OmegaConf
@@ -113,6 +114,13 @@ def run():
         **OmegaConf.to_container(cfg.exec),  # type: ignore
     )
 
+    # Setup per-step grading if enabled
+    grading_callback = None
+    if cfg.per_step_grading.enabled:
+        from .utils.mlebench_grading import setup_per_step_grading
+        competition_id = cfg.competition_id or os.environ.get("COMPETITION_ID")
+        grading_callback = setup_per_step_grading(cfg, competition_id)
+
     global_step = len(journal)
     prog = Progress(
         TextColumn("[progress.description]{task.description}"),
@@ -125,7 +133,38 @@ def run():
 
     def exec_callback(*args, **kwargs):
         status.update("[magenta]Executing code...")
-        res = interpreter.run(*args, **kwargs)
+        max_retries = int(os.environ.get("AIDE_REPL_RETRIES", "2") or "2")
+        for attempt in range(max_retries + 1):
+            try:
+                res = interpreter.run(*args, **kwargs)
+                break
+            except RuntimeError as e:
+                # The REPL is a separate OS process; it can die (OOM/segfault/kill) without a Python exception.
+                # On these failures, restart the REPL and retry this same step a few times.
+                if "REPL child process" not in str(e):
+                    raise
+                logger.error(
+                    "REPL crash at step %s (attempt %s/%s): %s",
+                    len(journal),
+                    attempt + 1,
+                    max_retries + 1,
+                    e,
+                )
+                try:
+                    interpreter.cleanup_session()
+                except Exception as cleanup_err:
+                    logger.error(f"Cleanup after REPL crash failed: {cleanup_err}")
+                if attempt < max_retries:
+                    # Small backoff to avoid immediate crash loops (e.g., transient resource pressure).
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                res = ExecutionResult(
+                    term_out=[f"RuntimeError: {e}\n"],
+                    exec_time=0.0,
+                    exc_type="RuntimeError",
+                    exc_info={"args": [str(e)]},
+                    exc_stack=None,
+                )
         status.update("[green]Generating code...")
         return res
 
@@ -161,16 +200,32 @@ def run():
         refresh_per_second=16,
         screen=True,
     ) as live:
-        while global_step < cfg.agent.steps:
-            agent.step(exec_callback=exec_callback)
-            save_run(cfg, journal)
-            global_step = len(journal)
-            live.update(generate_live())
-    interpreter.cleanup_session()
+        try:
+            while global_step < cfg.agent.steps:
+                agent.step(exec_callback=exec_callback)
+                save_run(cfg, journal)
+                global_step = len(journal)
+
+                # Per-step grading
+                if grading_callback is not None:
+                    grading_callback.on_step_complete(journal, global_step, cfg.workspace_dir, cfg)
+
+                live.update(generate_live())
+        finally:
+            # Ensure cleanup happens even if loop exits early
+            try:
+                interpreter.cleanup_session()
+            except Exception as e:
+                logger.error(f"Final interpreter cleanup failed: {e}")
 
     # Export final submissions
     print("\nExporting final submissions...")
     export_final_submissions(cfg, journal)
+
+    # Save per-step grading results
+    if grading_callback is not None:
+        print("Saving per-step grading results...")
+        grading_callback.save_results()
 
     if cfg.generate_report:
         print("Generating final report from journal...")

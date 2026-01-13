@@ -176,12 +176,12 @@ class Journal(DataClassJsonMixin):
     @property
     def buggy_nodes(self) -> list[Node]:
         """Return a list of nodes that are considered buggy by the agent."""
-        return [n for n in self.nodes if n.is_buggy]
+        return [n for n in self.nodes if n.is_buggy is True]
 
     @property
     def good_nodes(self) -> list[Node]:
         """Return a list of nodes that are not considered buggy by the agent."""
-        return [n for n in self.nodes if not n.is_buggy]
+        return [n for n in self.nodes if n.is_buggy is False]
 
     def get_metric_history(self) -> list[MetricValue]:
         """Return a list of all metric values in the journal."""

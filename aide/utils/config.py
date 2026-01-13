@@ -7,7 +7,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Hashable, cast
+from typing import Any, Hashable, cast, List, Optional
 
 import coolname
 import rich
@@ -36,6 +36,10 @@ logger.setLevel(logging.WARNING)
 class StageConfig:
     model: str
     temp: float
+    # Optional OpenAI-compatible endpoint override (used by some run scripts).
+    base_url: Optional[str] = None
+    # Optional explicit key override (env var is typical).
+    api_key: Optional[str] = None
 
 
 @dataclass
@@ -156,6 +160,20 @@ class ExportConfig:
 
 
 @dataclass
+class PerStepGradingConfig:
+    """
+    Configuration for per-step grading (generalization gap experiments).
+    Grades all selection methods at each step using MLE-bench ground truth.
+    """
+    enabled: bool = False
+    mlebench_data_dir: str = "/home/ka3094/mle-bench/data/competitions"
+    methods: List[str] = field(default_factory=lambda: ["best_valid", "mean_minus_k_std", "maximin", "elite_maximin"])
+    grade_every_n_steps: int = 1
+    # Write `per_step_grading/grading_history.*` incrementally during the run.
+    save_every_n_steps: int = 1
+
+
+@dataclass
 class AgentConfig:
     steps: int
     k_fold_validation: int
@@ -205,6 +223,10 @@ class Config(Hashable):
     timing: TimingConfig
     post_search: PostSearchConfig
     export: ExportConfig
+    per_step_grading: PerStepGradingConfig
+
+    # Optional competition ID for per-step grading
+    competition_id: Optional[str] = None
 
 
 def _get_next_logindex(dir: Path) -> int:

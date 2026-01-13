@@ -60,7 +60,12 @@ def query(
 
     filtered_kwargs: dict = select_values(notnone, model_kwargs)
     if "max_tokens" in filtered_kwargs:
-        filtered_kwargs["max_output_tokens"] = filtered_kwargs.pop("max_tokens")
+        max_tokens_val = filtered_kwargs.pop("max_tokens")
+        # o4-mini uses max_completion_tokens, other o-models use max_output_tokens
+        if filtered_kwargs.get("model") == "o4-mini":
+            filtered_kwargs["max_completion_tokens"] = max_tokens_val
+        else:
+            filtered_kwargs["max_output_tokens"] = max_tokens_val
 
     if (
         re.match(r"^o\d", filtered_kwargs["model"])
