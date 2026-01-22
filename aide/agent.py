@@ -17,6 +17,7 @@ from .utils import data_preview
 from .utils.config import Config
 from .utils.metric import MetricValue, WorstMetricValue
 from .utils.metrics_io import normalize_metrics, parse_aide_metrics
+from .utils.mlebench_grading import _maybe_coerce_submission_header, _read_csv_header
 from .utils.response import extract_code, extract_text_up_to_code, wrap_code
 from .utils.stage_manager import StageInfo, StageManager
 
@@ -75,6 +76,8 @@ class Agent:
             lines.append(f"Plan: {node.plan}")
         if node.exc_type:
             lines.append(f"Error: {node.exc_type}")
+        if node.analysis:
+            lines.append(f"Reviewer suggestion: {node.analysis}")
         if node.code:
             lines.append(f"Code:\n```python\n{node.code}\n```")
         out = node.term_out
@@ -130,6 +133,27 @@ class Agent:
             "**CRITICAL**: Follow these stage instructions exactly."
         )
 
+    def _is_timeout_node(self, node: Node) -> bool:
+        """Check if node failed due to timeout (unfixable by debugging)."""
+        # Check exception type
+        if node.exc_type and "timeout" in node.exc_type.lower():
+            return True
+        # Check output for timeout indicators
+        # NOTE: "execution time: a moment seconds" means QUICK crash (< 1 sec), NOT timeout!
+        # NOTE: "time limit is" appears in ALL execution messages, so don't match on that
+        output = node.term_out or ""
+        timeout_patterns = [
+            "timeouterror: execution exceeded",  # Actual timeout from interpreter
+            "exceeded the time limit",           # Actual timeout message
+            "killed due to timeout",
+            "timed out",
+            "process killed",
+            "oom",                               # Out of memory
+            "out of memory",
+        ]
+        output_lower = output.lower()
+        return any(p in output_lower for p in timeout_patterns)
+
     def search_policy(self) -> Node | None:
         """Select a node to work on (or None to draft a new node)."""
         search_cfg = self.acfg.search
@@ -141,11 +165,12 @@ class Agent:
 
         # debugging
         if random.random() < search_cfg.debug_prob:
-            # nodes that are buggy + leaf nodes + debug depth < max debug depth
+            # nodes that are buggy + leaf nodes + debug depth < max debug depth + NOT timeout
             debuggable_nodes = [
                 n
                 for n in self.journal.buggy_nodes
-                if (n.is_leaf and n.debug_depth <= search_cfg.max_debug_depth)
+                if (n.is_leaf and n.debug_depth <= search_cfg.max_debug_depth
+                    and not self._is_timeout_node(n))
             ]
             if debuggable_nodes:
                 logger.debug("[search policy] debugging")
@@ -273,7 +298,7 @@ class Agent:
 
     def _draft(self) -> Node:
         stage_section = self._get_stage_prompt_section()
-        exec_summary = self.bug_consultant.get_prevention_guidance(mode="executive") if self.bug_consultant else ""
+        exec_summary = self.bug_consultant.get_prevention_guidance(mode="executive", journal=self.journal) if self.bug_consultant else ""
         bug_context_mode = str(getattr(self.acfg.search, "bug_context_mode", "consultant"))
 
         prompt: Any = {
@@ -292,6 +317,7 @@ class Agent:
             prompt["Bug Prevention Alert"] = exec_summary
 
         prompt["Instructions"] |= self._prompt_resp_fmt
+
         sketch_guideline = [
             "Keep the initial solution design relatively simple and robust; follow the Stage Instructions for subsampling, and CV folds.",
             "Take the Memory section into consideration when proposing the design,"
@@ -321,6 +347,8 @@ class Agent:
 
     def _improve(self, parent_node: Node) -> Node:
         stage_section = self._get_stage_prompt_section()
+        exec_summary = self.bug_consultant.get_prevention_guidance(mode="executive", journal=self.journal) if self.bug_consultant else ""
+        bug_context_mode = str(getattr(self.acfg.search, "bug_context_mode", "consultant"))
 
         prompt: Any = {
             "Introduction": (
@@ -338,8 +366,11 @@ class Agent:
         }
         if stage_section:
             prompt["Stage Instructions"] = stage_section
+        if exec_summary and bug_context_mode in ("consultant", "both"):
+            prompt["Bug Prevention Alert"] = exec_summary
 
         prompt["Instructions"] |= self._prompt_resp_fmt
+
         improve_guideline = [
             "The solution sketch should be a natural language description of how the previous solution can be improved.",
             "You should be very specific and propose concrete improvements that you will actually implement.",
@@ -356,7 +387,7 @@ class Agent:
 
         self._last_actor_context = {
             "stage": stage_section,
-            "bug_prevention": "",
+            "bug_prevention": exec_summary if bug_context_mode in ("consultant", "both") else "",
         }
         plan, code = self.plan_and_code_query(prompt)
         return Node(
@@ -367,7 +398,7 @@ class Agent:
 
     def _debug(self, parent_node: Node) -> Node:
         stage_section = self._get_stage_prompt_section()
-        exec_summary = self.bug_consultant.get_prevention_guidance(mode="executive") if self.bug_consultant else ""
+        # Debug gets RAG context (similar bugs) not general prevention guidance
         bug_context_mode = str(getattr(self.acfg.search, "bug_context_mode", "consultant"))
         debug_history = ""
         active_trials = ""
@@ -410,8 +441,7 @@ class Agent:
         }
         if stage_section:
             prompt["Stage Instructions"] = stage_section
-        if exec_summary and bug_context_mode in ("consultant", "both"):
-            prompt["Bug Prevention Alert"] = exec_summary
+        # Debug gets RAG context (specific to this bug type), not general prevention
         if debug_history and bug_context_mode in ("consultant", "both"):
             prompt["Historical Bug Context (Curated)"] = debug_history
         if active_trials:
@@ -421,8 +451,9 @@ class Agent:
 
         prompt["Instructions"] |= self._prompt_resp_fmt
         bugfix_guideline = [
+            "BLOCKLIST CHECK: Read 'Historical Bug Context' and 'Current Bug Trial History' - those approaches have ALREADY FAILED and WILL CRASH AGAIN if you use them. You MUST use a DIFFERENT approach.",
             "You should write a natural language description of how the issue in the previous implementation can be fixed.",
-            "**FOR QUICK DEBUGGING**: Subsample the data to approximately 10% (0.1 fraction) at the beginning of your code to speed up debugging. Add a clear comment like `# DEBUG: Using 10% subsample for fast iteration` so it can be removed once the bug is fixed.",
+            "**FOR QUICK DEBUGGING** (ONLY for datasets >50,000 rows): You may subsample to 10%, but MUST check class counts first to avoid crashes:\n```python\nmin_class_count = y.value_counts().min()\nn_splits = 5\nif min_class_count >= n_splits:\n    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)\nelse:\n    cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)  # FALLBACK\n```\nNEVER use StratifiedKFold on subsampled data without checking class counts! Add `# DEBUG: Using 10% subsample` comment so it can be removed once fixed.",
             "Don't suggest to do EDA.",
         ]
         length_guideline = self._solution_sketch_length_guideline()
@@ -442,11 +473,30 @@ class Agent:
 
         self._last_actor_context = {
             "stage": stage_section,
-            "bug_prevention": exec_summary if bug_context_mode in ("consultant", "both") else "",
             "historical_bug_context": debug_history if bug_context_mode in ("consultant", "both") else "",
             "past_buggy_nodes": past_buggy_nodes,
             "approved_solution_plan": parent_node.plan or "",
         }
+
+        # Log and save debug context being passed
+        logger.info("=== DEBUG NODE CONTEXT ===")
+        debug_context_parts = []
+        if debug_history and bug_context_mode in ("consultant", "both"):
+            logger.info("[Historical Bug Context]:\n%s", debug_history)
+            debug_context_parts.append(f"## Historical Bug Context\n{debug_history}")
+        if active_trials:
+            logger.info("[Current Bug Trial History]:\n%s", active_trials)
+            debug_context_parts.append(f"## Current Bug Trial History\n{active_trials}")
+        logger.info("=== END DEBUG NODE CONTEXT ===")
+
+        # Save debug context to file
+        if self.bug_consultant and self.bug_consultant.save_dir and debug_context_parts:
+            try:
+                debug_file = self.bug_consultant.save_dir / f"debug_context_step_{parent_node.step}.md"
+                debug_file.write_text("\n\n".join(debug_context_parts))
+            except Exception:
+                pass
+
         plan, code = self.plan_and_code_query(prompt)
         return Node(plan=plan, code=code, parent=parent_node)
 
@@ -714,7 +764,37 @@ class Agent:
                 solutions_dir.mkdir(parents=True, exist_ok=True)
                 submission_dst = solutions_dir / f"submission_node_{node.step}.csv"
                 if not submission_dst.exists():
-                    submission_dst.write_bytes(submission_src.read_bytes())
+                    adjusted_src = submission_src
+                    tmp_adjusted: Path | None = None
+                    sample_submission = Path(self.cfg.workspace_dir) / "input" / "sample_submission.csv"
+                    expected_cols: list[str] | None = None
+                    if sample_submission.exists():
+                        try:
+                            expected_cols = _read_csv_header(sample_submission)
+                        except Exception as e:  # pragma: no cover - best-effort logging only
+                            logger.debug(
+                                "Failed to read sample submission header (%s): %s",
+                                sample_submission,
+                                e,
+                            )
+                    if expected_cols:
+                        tmp_adjusted, coerce_err = _maybe_coerce_submission_header(
+                            submission_src, expected_cols
+                        )
+                        if coerce_err is not None:
+                            logger.debug(
+                                "Submission schema auto-coercion skipped: %s",
+                                coerce_err,
+                            )
+                        elif tmp_adjusted is not None:
+                            adjusted_src = tmp_adjusted
+                            logger.debug(
+                                "Submission schema adjusted to match sample header: %s",
+                                sample_submission,
+                            )
+                    submission_dst.write_bytes(adjusted_src.read_bytes())
+                    if tmp_adjusted is not None and tmp_adjusted.exists():
+                        tmp_adjusted.unlink(missing_ok=True)
                     try:
                         node.submission_csv_path = str(submission_dst)
                         # Calculate SHA256 hash

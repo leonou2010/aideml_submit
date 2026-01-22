@@ -67,9 +67,11 @@ def query(
         else:
             filtered_kwargs["max_output_tokens"] = max_tokens_val
 
+    # Models that don't support temperature parameter
     if (
         re.match(r"^o\d", filtered_kwargs["model"])
         or filtered_kwargs["model"] == "codex-mini-latest"
+        or filtered_kwargs["model"] == "gpt-5-mini"
     ):
         filtered_kwargs.pop("temperature", None)
 

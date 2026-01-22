@@ -13,6 +13,7 @@ This module is adapted from `references/aideml_vm/aide/bug_consultant_v2.py` wit
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -61,7 +62,8 @@ class BugRecord:
     original_plan: str
 
     trials: list[DebugTrial] = field(default_factory=list)
-    final_outcome: str = "in_progress"  # "success" | "abandoned" | "in_progress"
+    final_outcome: str = "in_progress"  # "success" | "abandoned" | "in_progress" | "dead"
+    is_dead: bool = False  # True for timeout/unfixable bugs - never debug these
 
     # LLM-summarized fields at bug start (for RAG)
     error_signature: Optional[str] = None  # Specific error message (LLM-extracted)
@@ -144,25 +146,25 @@ summarize_bug_start_spec = FunctionSpec(
         "properties": {
             "error_signature": {
                 "type": "string",
-                "description": "Compact, searchable error signature capturing the SPECIFIC error message for semantic matching. Example: 'TypeError: LGBMRegressor.fit() got unexpected keyword argument early_stopping_rounds'. Be precise and concise - include the error type and the key message that differentiates this from other similar errors.",
+                "description": "EXACT error message from output. Copy the actual error line like 'TypeError: fit() got unexpected keyword argument'. If no error in output, use 'Unknown: no traceback'.",
             },
             "error_category": {
                 "type": "string",
-                "description": "High-level category for grouping: API_MISUSE (wrong API usage), MISSING_DATA (NaN/missing values), TYPE_ERROR (type mismatch), IMPORT_ERROR (module not found), LOGIC_ERROR (wrong logic), VALUE_ERROR (invalid value), ATTRIBUTE_ERROR (missing attribute), KEY_ERROR (missing key), INDEX_ERROR (out of bounds), or OTHER",
-            },
-            "initial_hypothesis": {
-                "type": "string",
-                "description": "Preliminary root cause hypothesis - what likely caused this error based on the signature and output. Be specific about the technical reason. Example: 'LightGBM sklearn API changed - early_stopping_rounds parameter was removed in newer versions, now requires callbacks=[lgb.early_stopping()] instead'.",
+                "description": "Category: TYPE_ERROR, VALUE_ERROR, ATTRIBUTE_ERROR, KEY_ERROR, INDEX_ERROR, IMPORT_ERROR, FILE_NOT_FOUND, TIMEOUT, UNKNOWN, or OTHER",
             },
             "context_tags": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "3-7 relevant context tags for RAG semantic matching. Include: library names, API names, error-specific keywords, domain terms. Example: ['lightgbm', 'sklearn_api', 'early_stopping', 'parameter_deprecation']. Use lowercase, underscores for multi-word tags.",
+                "description": "Library/function names from the error. Example: ['lightgbm', 'fit', 'early_stopping']. Only include what's actually mentioned in the error.",
+            },
+            "is_unfixable": {
+                "type": "boolean",
+                "description": "True ONLY for actual timeout or OOM. False for all code errors.",
             },
         },
-        "required": ["error_signature", "error_category", "initial_hypothesis", "context_tags"],
+        "required": ["error_signature", "error_category", "context_tags", "is_unfixable"],
     },
-    description="Summarize a new bug at start for RAG retrieval. Keep outputs concise but informative - error_signature should be one line, hypothesis should be 1-2 sentences.",
+    description="Extract error info from output. Only include what's actually in the error - no speculation.",
 )
 
 summarize_trial_failure_spec = FunctionSpec(
@@ -170,22 +172,22 @@ summarize_trial_failure_spec = FunctionSpec(
     json_schema={
         "type": "object",
         "properties": {
-            "why_failed": {
+            "what_was_tried": {
                 "type": "string",
-                "description": "Specific reason WHY this debug approach failed - focus on the ROOT CAUSE of failure, not just repeating the error type. Be concise (1-2 sentences). Example: 'Model still expects early_stopping_rounds despite using callbacks - incorrect callback API usage, needs eval_set parameter too'.",
+                "description": "Brief description of what approach was attempted. Example: 'Used callbacks parameter in fit()'",
+            },
+            "actual_error": {
+                "type": "string",
+                "description": "The EXACT error message from output. Copy the error line.",
             },
             "failed_strategy_summary": {
                 "type": "string",
-                "description": "One-line summary of the failed strategy for RL learning. Format: '<what was tried> → Failed: <why>'. Example: 'Use callbacks without eval_set → Failed: callbacks require validation data'. Keep concise.",
-            },
-            "learned_constraint": {
-                "type": "string",
-                "description": "A reusable constraint/rule learned from this failure - one concise sentence that prevents repeating this mistake. Example: 'LightGBM callbacks require both callbacks=[] AND eval_set=[(X_val, y_val)] parameters together'.",
+                "description": "Format: '<what was tried> → <actual error>'. Example: 'Used callbacks in fit() → TypeError: unexpected keyword argument callbacks'",
             },
         },
-        "required": ["why_failed", "failed_strategy_summary", "learned_constraint"],
+        "required": ["what_was_tried", "actual_error", "failed_strategy_summary"],
     },
-    description="Summarize a failed debug trial for RL. Extract specific failure reason, strategy summary, and learned constraint to prevent repeating this mistake. Be concise but informative.",
+    description="Summarize what was tried and what error occurred. NO suggestions for fixes - only capture the failure.",
 )
 
 summarize_trial_success_spec = FunctionSpec(
@@ -252,6 +254,24 @@ format_context_spec = FunctionSpec(
     description="Organize selected historical bugs into a clear markdown context for the actor.",
 )
 
+distill_world_model_spec = FunctionSpec(
+    name="distill_world_model",
+    json_schema={
+        "type": "object",
+        "properties": {
+            "banned_parameters": {
+                "type": "string",
+                "description": "Parameter errors. Format: DON'T [bad] → DO [good]. Example: 'DON'T use early_stopping_rounds → DO use callbacks'",
+            },
+            "known_failures": {
+                "type": "string",
+                "description": "All other errors. Format: DON'T [bad] → DO [good]. Example: 'DON'T call .median() on all columns → DO call .median(numeric_only=True)'",
+            },
+        },
+        "required": ["banned_parameters", "known_failures"],
+    },
+    description="Convert crash errors into DON'T/DO rules with alternatives",
+)
 
 # ═══════════════════════════════════════════════════════════
 # Bug Consultant Class
@@ -301,6 +321,11 @@ class BugConsultant:
         # World model version counter (increments on write)
         self.world_model_version: int = 0
 
+        # Distilled guidance cache (invalidated when content actually changes)
+        self._distilled_guidance: str = ""
+        self._distilled_content_hash: str = ""  # Hash of input content when last distilled
+        self._distilled_version: int = -1  # Version when last distilled (backup)
+
         logger.info("🗂️  BugConsultant v2 initialized (model: %s)", model)
 
     # ═══════════════════════════════════════════════════════════
@@ -326,12 +351,24 @@ class BugConsultant:
         )
 
         # Stage 1: LLM summarization at bug start (for RAG)
+        # This also determines if the error is unfixable (timeout/OOM/killed)
         logger.debug("Summarizing bug start for %s", bug_id)
         summary = self._summarize_bug_start(record)
         record.error_signature = summary.get("error_signature")
         record.error_category = summary.get("error_category")
         record.initial_hypothesis = summary.get("initial_hypothesis")
         record.context_tags = summary.get("context_tags", [])
+
+        # Check if LLM determined this is unfixable (timeout/OOM/killed)
+        if summary.get("is_unfixable", False):
+            record.is_dead = True
+            record.final_outcome = "dead"
+            record.lesson = f"Unfixable error: {record.initial_hypothesis}"
+            self.bug_records[bug_id] = record
+            logger.info("💀 Created DEAD bug record: %s (unfixable: %s)", bug_id, record.error_category)
+            self._save_bug_record(record, active=False)
+            self._save_world_model()
+            return ""  # Return empty - no active bug to debug
 
         self.active_bugs[bug_id] = record
         logger.info("📝 Started bug record: %s (category: %s)", bug_id, record.error_category)
@@ -378,17 +415,12 @@ class BugConsultant:
             summary = self._summarize_trial_failure(trial, record)
 
             # Store LLM-extracted insights in the trial
-            trial.why_failed = summary.get("why_failed", trial.why_failed)
+            trial.why_failed = summary.get("actual_error", trial.why_failed)
 
             # Add to failed strategies (for RL: prevent retrying)
             failed_strategy = summary.get("failed_strategy_summary", "")
             if failed_strategy and failed_strategy not in record.failed_strategies:
                 record.failed_strategies.append(failed_strategy)
-
-            # Add to learned constraints (reusable rules)
-            constraint = summary.get("learned_constraint", "")
-            if constraint and constraint not in record.learned_constraints:
-                record.learned_constraints.append(constraint)
 
             logger.info("📊 Recorded FAILED trial #%s for %s: %s", trial.attempt_num, bug_id, failed_strategy)
 
@@ -602,11 +634,15 @@ class BugConsultant:
                 "- ACTIVE: Currently being debugged - shows what DIDN'T WORK (crucial for RL!)"
             ),
             "Task": (
-                "Select an OPTIMAL set of relevant bug IDs based on semantic similarity.\n"
-                "- Exact match: 1-2 bugs\n"
-                "- Related patterns: 2-4 bugs\n"
-                "- Unrelated: 0 bugs\n\n"
-                "CRITICAL: Include ACTIVE bugs if similar - their failed_strategies show what to AVOID!"
+                "[Quick extraction - respond directly]\n"
+                "Select ALL relevant bug IDs that match the current error.\n"
+                "Include bugs that:\n"
+                "- Have the same or similar error signature\n"
+                "- Have the same error category\n"
+                "- Share context tags with the current error\n"
+                "- Have failed_strategies that could apply to this bug\n\n"
+                "Do NOT limit the count artificially - if 10 bugs are relevant, select all 10.\n"
+                "CRITICAL: Include ACTIVE bugs - their failed_strategies show what to AVOID!"
             ),
         }
 
@@ -646,70 +682,66 @@ class BugConsultant:
             }
 
     def format_context_for_actor(self, retrieval_result: dict) -> str:
+        """Format historical context using ONLY evidence-based information.
+
+        CRITICAL: No LLM call here - LLM was inventing suggestions that hadn't been proven.
+        Only include information that is actually recorded in bug records.
+        """
         if not retrieval_result.get("selected_bugs"):
             return "No relevant historical bugs found."
 
-        bugs_data = []
-        for record in retrieval_result["selected_bugs"]:
-            bugs_data.append(
-                {
-                    "error_type": record.error_type,
-                    "root_cause": record.root_cause,
-                    "trials": [
-                        {"attempt": t.attempt_num, "strategy": t.debug_plan, "outcome": t.outcome}
-                        for t in record.trials
-                    ],
-                    "successful_strategy": record.successful_strategy,
-                    "failed_strategies": record.failed_strategies,
-                    "lesson": record.lesson,
-                }
-            )
+        lines = ["# Historical Bug Context (Similar bugs to yours)", ""]
 
-        prompt = {
-            "Your Role": "Format historical context for code generation",
-            "Selected Bugs": bugs_data,
-            "Key Patterns": retrieval_result.get("key_patterns", []),
-            "Reasoning": retrieval_result.get("reasoning", ""),
-            "Task": (
-                "Format into clean, concise markdown.\n"
-                "Sections:\n"
-                "1) Overview\n"
-                "2) What Worked\n"
-                "3) What Failed\n"
-                "4) Key Patterns\n"
-                "5) Lessons\n"
-                "Avoid verbosity; focus on actionable, reusable information."
-            ),
-        }
+        # FAILED FIRST - most important to avoid repeating
+        lines.append("## WILL CRASH - NEVER USE THESE (already failed, will fail again)")
+        has_failures = False
+        for r in retrieval_result["selected_bugs"]:
+            if r.failed_strategies:
+                has_failures = True
+                for strategy in r.failed_strategies:
+                    lines.append(f"- {strategy}")
+        if not has_failures:
+            lines.append("- (no recorded failures yet)")
+        lines.append("")
 
-        try:
-            result = query(
-                system_message=prompt,
-                user_message=None,
-                func_spec=format_context_spec,
-                model=self.model,
-                temperature=0.3,
-            )
-            formatted = result.get("formatted_context", "") or ""
-            # Safety valve: truncation is allowed ONLY for memory management.
-            if self.advice_budget_chars > 0 and len(formatted) > self.advice_budget_chars:
-                return formatted[: self.advice_budget_chars].rstrip()
-            return formatted
-        except Exception as e:
-            logger.error("Context formatting failed: %s", e)
-            lines = ["# Historical Context", ""]
-            for record in retrieval_result["selected_bugs"]:
-                lines.append(f"## {record.error_type}")
-                if record.lesson:
-                    lines.append(f"- Lesson: {record.lesson}")
-                lines.append("")
-            return "\n".join(lines).strip()
+        # What Worked - ONLY from actual successful_strategy fields
+        lines.append("## USE THESE APPROACHES (proven to work)")
+        worked = [r for r in retrieval_result["selected_bugs"] if r.successful_strategy]
+        if worked:
+            for r in worked:
+                lines.append(f"- RECOMMENDED: {r.successful_strategy}")
+        else:
+            lines.append("- (no proven fixes yet - find a NEW approach different from failed ones)")
+        lines.append("")
+
+        # Lessons
+        lessons = [r for r in retrieval_result["selected_bugs"] if r.lesson]
+        if lessons:
+            lines.append("## Lessons Learned")
+            for r in lessons:
+                lines.append(f"- {r.lesson}")
+            lines.append("")
+
+        # Key patterns from retrieval (from the retrieval LLM, which is OK)
+        if retrieval_result.get("key_patterns"):
+            lines.append("## Key Patterns")
+            for pattern in retrieval_result["key_patterns"]:
+                lines.append(f"- {pattern}")
+            lines.append("")
+
+        result = "\n".join(lines)
+
+        # Safety valve: truncation for context length management
+        if self.advice_budget_chars > 0 and len(result) > self.advice_budget_chars:
+            return result[: self.advice_budget_chars].rstrip()
+
+        return result
 
     def get_guidance(self, plan: str = "", current_node: Optional["Node"] = None) -> str:
         """
-        Convenience wrapper (reference behavior): retrieve relevant bugs and format them.
+        Convenience wrapper: retrieve relevant bugs and format them.
 
-        Note: this is still two LLM calls (retrieve + format), matching the reference implementation.
+        Note: Only one LLM call (retrieve). Format is now deterministic to prevent embellishment.
         """
         if not current_node:
             return ""
@@ -733,39 +765,111 @@ class BugConsultant:
             logger.error("get_guidance failed: %s", e)
             return ""
 
-    def get_prevention_guidance(self, mode: str = "executive") -> str:
+    def get_prevention_guidance(self, mode: str = "executive", journal: Optional["Journal"] = None) -> str:
         """
-        Executive summary for prompts (reference-style): top recent lessons.
-
-        This is a compact, prompt-safe view; detailed context should come from `get_guidance()`.
+        Returns distilled DO/DON'T guidance for draft/improve nodes.
+        Uses LLM to convert verbose bug summaries into actionable code patterns.
+        Caches result until bug content actually changes (content-hash based).
         """
-        # Include BOTH completed and active bugs for early-run guidance
         if not self.bug_records and not self.active_bugs:
             return ""
 
-        lessons = []
-        # Most recent first - include completed bugs
-        for record in sorted(self.bug_records.values(), key=lambda r: r.timestamp, reverse=True):
-            if record.lesson:
-                lessons.append(f"- {record.error_type}: {record.lesson}")
+        # Get raw world model content
+        raw_content = self._render_world_model(journal=journal)
 
-        # Also include lessons from active bugs (what's currently failing)
-        for record in sorted(self.active_bugs.values(), key=lambda r: r.timestamp, reverse=True):
-            if record.failed_strategies:
-                # Show what's NOT working for active bugs
-                for strategy in record.failed_strategies[:2]:  # Top 2 failed strategies per active bug
-                    lessons.append(f"- {record.error_type} [ACTIVE]: Avoid: {strategy}")
+        # Compute content hash to detect actual changes
+        content_hash = hashlib.md5(raw_content.encode()).hexdigest()
 
-        if not lessons:
+        # Check if cache is valid (content hasn't changed)
+        if self._distilled_content_hash == content_hash and self._distilled_guidance:
+            logger.debug("Using cached distilled guidance (no content change)")
+            return self._distilled_guidance
+
+        # Distill into DO/DON'T format
+        distilled = self._distill_guidance(raw_content)
+
+        # Cache the result with content hash
+        self._distilled_guidance = distilled
+        self._distilled_content_hash = content_hash
+        self._distilled_version = self.world_model_version
+
+        # Save to disk
+        if self.save_dir:
+            try:
+                path = self.save_dir / "distilled_guidance.md"
+                path.write_text(distilled)
+                logger.info("Saved distilled guidance to %s", path)
+            except Exception as e:
+                logger.error("Failed to save distilled guidance: %s", e)
+
+        # Log what's being passed
+        logger.info("=== DISTILLED GUIDANCE BEING PASSED ===")
+        logger.info("%s", distilled[:2000] if len(distilled) > 2000 else distilled)
+        logger.info("=== END DISTILLED GUIDANCE ===")
+
+        return distilled
+
+    def _distill_guidance(self, raw_world_model: str) -> str:
+        """
+        Create guidance from bug patterns - ONLY what NOT to do.
+
+        CRITICAL PRINCIPLE: Only output what is PROVEN.
+        - Failed strategies → say "DON'T do X" (proven to fail)
+        - Successful strategies → say "DO X" (proven to work)
+        - NO SUGGESTIONS for alternatives unless proven
+        """
+        if not raw_world_model.strip():
             return ""
 
-        header = f"📚 Historical Bug Lessons ({len(self.bug_records)} bugs tracked):"
-        body = "\n".join(lessons[:5])  # Top 5 most recent
-        out = f"{header}\n{body}".strip()
-        # Safety valve: truncation is allowed ONLY for memory management.
-        if mode == "executive" and self.advice_budget_chars > 0 and len(out) > self.advice_budget_chars:
-            return out[: self.advice_budget_chars].rstrip()
-        return out
+        all_bugs = list(self.bug_records.values()) + list(self.active_bugs.values())
+        if not all_bugs:
+            return ""
+
+        # Collect PROVEN failures and PROVEN successes separately
+        proven_failures = []  # What NOT to do
+        proven_successes = []  # What TO do (only if proven)
+
+        for record in all_bugs:
+            # Add failed strategies (proven to crash)
+            for strategy in record.failed_strategies or []:
+                if strategy and len(strategy) > 10:
+                    proven_failures.append(strategy)
+
+            # Add successful strategy ONLY if bug was actually fixed
+            if record.final_outcome == "success" and record.successful_strategy:
+                proven_successes.append(record.successful_strategy)
+
+        # Build simple DON'T / DO output - NO LLM CALL needed!
+        lines = []
+
+        if proven_failures:
+            lines.append("## WILL CRASH - DO NOT USE:")
+            # Dedupe and limit
+            seen = set()
+            for f in proven_failures:
+                f_norm = f.strip().lower()
+                if f_norm not in seen:
+                    seen.add(f_norm)
+                    lines.append(f"- {f}")
+                if len(seen) >= 20:
+                    break
+
+        if proven_successes:
+            lines.append("")
+            lines.append("## PROVEN TO WORK:")
+            seen = set()
+            for s in proven_successes:
+                s_norm = s.strip().lower()
+                if s_norm not in seen:
+                    seen.add(s_norm)
+                    lines.append(f"- {s}")
+                if len(seen) >= 10:
+                    break
+
+        if not lines:
+            return ""
+
+        return "\n".join(lines)
 
     def get_statistics(self) -> dict:
         return {
@@ -781,24 +885,19 @@ class BugConsultant:
 
     def _summarize_bug_start(self, record: BugRecord) -> dict:
         """
-        Stage 1: Summarize a new bug at start for RAG retrieval.
-        Extracts error signature, category, hypothesis, and context tags.
+        Stage 1: Extract error info from output for RAG retrieval.
+        Simple extraction - NO speculation, NO hypotheses.
         """
         prompt = {
-            "Your Role": "Summarize a new bug for semantic retrieval",
-            "Bug Context": {
-                "Error Type": record.error_type,
-                "Error Output": record.buggy_output,
-                "Buggy Code": record.buggy_code,
-                "Original Plan": record.original_plan,
-            },
+            "Role": "Extract error information from output",
+            "Error Output": record.buggy_output,
             "Task": (
-                "Extract structured information for RAG matching:\n\n"
-                "1. ERROR SIGNATURE: Specific error message (not generic 'Traceback...')\n"
-                "2. ERROR CATEGORY: High-level category (API_MISUSE, TYPE_ERROR, etc.)\n"
-                "3. INITIAL HYPOTHESIS: Preliminary root cause (what likely caused this)\n"
-                "4. CONTEXT TAGS: 3-7 relevant tags for semantic matching\n\n"
-                "This information helps match similar bugs later."
+                "Extract ONLY what's in the error output:\n"
+                "1. error_signature: Copy the EXACT error line (e.g., 'TypeError: fit() got unexpected...')\n"
+                "2. error_category: TYPE_ERROR, VALUE_ERROR, FILE_NOT_FOUND, TIMEOUT, UNKNOWN, etc.\n"
+                "3. context_tags: Library/function names mentioned in error\n"
+                "4. is_unfixable: True only for timeout/OOM\n\n"
+                "If no traceback in output, use error_signature='Unknown: no traceback' and category='UNKNOWN'"
             ),
         }
 
@@ -808,44 +907,37 @@ class BugConsultant:
                 user_message=None,
                 func_spec=summarize_bug_start_spec,
                 model=self.model,
-                temperature=0.0,  # Deterministic for categorization
+                temperature=0.0,
             )
         except Exception as e:
             logger.error("Failed to summarize bug start: %s", e)
-            # Fallback to heuristic
+            # Simple fallback
             sig = self._error_signature(record.buggy_output)
             return {
-                "error_signature": sig or f"{record.error_type}: (no signature extracted)",
-                "error_category": "UNKNOWN",
-                "initial_hypothesis": f"Bug occurred during execution with error type {record.error_type}",
-                "context_tags": [record.error_type.lower().replace(" ", "_")] if record.error_type else [],
+                "error_signature": sig or "Unknown: no traceback",
+                "error_category": "UNKNOWN" if not sig else "OTHER",
+                "context_tags": [],
+                "is_unfixable": False,
             }
 
     def _summarize_trial_failure(self, trial: DebugTrial, record: BugRecord) -> dict:
         """
-        Stage 2a: Summarize a failed debug trial for RL.
-        Extracts why it failed, strategy summary, and learned constraint.
+        Summarize a failed trial - capture what was tried and what error occurred.
+        NO suggestions for fixes - only capture the failure.
         """
+        error_output = trial.error_output or ""
+        error_sig = self._error_signature(error_output) or trial.error_type or "unknown error"
+
         prompt = {
-            "Your Role": "Analyze why this debug attempt failed",
-            "Original Bug": {
-                "Error Type": record.error_type,
-                "Original Error": record.buggy_output[:1000],  # Truncate for context
-            },
-            "Failed Debug Attempt": {
-                "Attempt Number": trial.attempt_num,
-                "Debug Plan": trial.debug_plan,
-                "Code Executed": trial.code,
-                "Error Output": trial.error_output,
-                "Error Type": trial.error_type,
-            },
-            "Previous Failed Attempts": record.failed_strategies[-3:] if record.failed_strategies else [],
+            "Role": "Capture what was tried and what error occurred",
+            "Debug Plan": trial.debug_plan,
+            "Error Output": error_output[:1000],
             "Task": (
-                "Extract structured knowledge from this failure:\n\n"
-                "1. WHY FAILED: Root cause of why THIS specific approach didn't work\n"
-                "2. FAILED STRATEGY SUMMARY: One-line summary for RL\n"
-                "3. LEARNED CONSTRAINT: Reusable rule to prevent repeating this\n\n"
-                "This helps avoid retrying the same failed approach."
+                "Extract:\n"
+                "1. what_was_tried: Brief description of the approach\n"
+                "2. actual_error: Copy the EXACT error message\n"
+                "3. failed_strategy_summary: '<what tried> → <error>'\n\n"
+                "NO suggestions for fixes - only capture what failed."
             ),
         }
 
@@ -855,15 +947,16 @@ class BugConsultant:
                 user_message=None,
                 func_spec=summarize_trial_failure_spec,
                 model=self.model,
-                temperature=0.1,
+                temperature=0.0,
             )
         except Exception as e:
             logger.error("Failed to summarize trial failure: %s", e)
-            # Fallback
+            # Simple fallback - just capture what happened
+            plan_short = (trial.debug_plan or "").strip().split('\n')[0][:80]
             return {
-                "why_failed": trial.error_output[:200] if trial.error_output else f"Failed with {trial.error_type}",
-                "failed_strategy_summary": f"{trial.debug_plan[:100]} → Failed",
-                "learned_constraint": f"Approach from attempt {trial.attempt_num} did not resolve {record.error_type}",
+                "what_was_tried": plan_short or "Unknown approach",
+                "actual_error": error_sig,
+                "failed_strategy_summary": f"{plan_short} → {error_sig}",
             }
 
     def _summarize_trial_success(self, trial: DebugTrial, record: BugRecord) -> dict:
@@ -885,6 +978,7 @@ class BugConsultant:
             },
             "Previous Failed Attempts": record.failed_strategies,
             "Task": (
+                "[Quick extraction - respond directly]\n"
                 "Analyze WHY this approach succeeded where others failed.\n\n"
                 "Extract:\n"
                 "1. WHY WORKED: Specific technical reason this succeeded (1-2 sentences)\n"
@@ -944,6 +1038,7 @@ class BugConsultant:
             ],
             "Final Outcome": record.final_outcome,
             "Task": (
+                "[Quick extraction - respond directly]\n"
                 "Extract structured knowledge:\n\n"
                 "1. ROOT CAUSE: What caused this bug?\n"
                 "2. SUCCESSFUL STRATEGY: What worked? (if any)\n"
@@ -1055,6 +1150,7 @@ class BugConsultant:
                     "Your Role": "Extract error signature from execution output",
                     "Execution Output": output,
                     "Task": (
+                        "[Quick extraction - respond directly]\n"
                         "Extract the SPECIFIC error message that would help identify this exact bug.\n"
                         "Examples:\n"
                         "- 'TypeError: fit() got an unexpected keyword argument early_stopping_rounds'\n"
@@ -1188,22 +1284,22 @@ class BugConsultant:
 
         trials = record.trials[-max(1, int(max_trials)) :]
         out: list[str] = []
-        out.append(f"Bug `{bug_id}` active attempts (most recent last):")
+        out.append(f"TRIAL HISTORY for `{bug_id}` — NEVER repeat failed approaches:")
         for t in trials:
             plan_line = (t.debug_plan or "").strip().splitlines()[0:1]
             plan_short = plan_line[0].strip() if plan_line else "(no plan)"
             if t.outcome == "failed":
                 why = (t.why_failed or t.error_output or t.error_type or "").strip()
                 why = " ".join(why.split())[:240]
-                out.append(f"- Attempt {t.attempt_num}: FAILED — {plan_short}")
+                out.append(f"- NEVER DO THIS (Attempt {t.attempt_num} CRASHED): {plan_short}")
                 if why:
-                    out.append(f"  - Why failed: {why}")
+                    out.append(f"  - Will crash because: {why}")
             else:
                 why = (t.why_worked or "").strip()
                 why = " ".join(why.split())[:240]
-                out.append(f"- Attempt {t.attempt_num}: SUCCESS — {plan_short}")
+                out.append(f"- USE THIS (Attempt {t.attempt_num} WORKED): {plan_short}")
                 if why:
-                    out.append(f"  - Why worked: {why}")
+                    out.append(f"  - Why it works: {why}")
         return "\n".join(out).strip()
 
     def _render_world_model(self, journal: Optional["Journal"] = None) -> str:

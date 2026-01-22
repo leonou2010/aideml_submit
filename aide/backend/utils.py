@@ -19,6 +19,7 @@ logger = logging.getLogger("aide")
     wait_gen=backoff.expo,
     max_value=60,
     factor=1.5,
+    max_tries=10,  # Limit retries to prevent infinite loops
 )
 def backoff_create(
     create_fn: Callable, retry_exceptions: list[Exception], *args, **kwargs
@@ -26,7 +27,7 @@ def backoff_create(
     try:
         return create_fn(*args, **kwargs)
     except retry_exceptions as e:
-        logger.info(f"Backoff exception: {e}")
+        logger.warning(f"Backoff exception (will retry up to 10 times): {e}")
         return False
 
 

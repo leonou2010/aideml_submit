@@ -13,7 +13,21 @@ import os
 import tempfile
 import math
 
+try:  # Optional dependency; present in all runner envs but guard just in case.
+    import numpy as _np  # type: ignore
+except Exception:  # pragma: no cover - fallback if numpy missing
+    _np = None
+
 logger = logging.getLogger("aide")
+
+
+def _json_default(obj):
+    """Convert numpy scalars (e.g., np.bool_) to native Python types for JSON."""
+    if _np is not None and isinstance(obj, _np.generic):
+        return obj.item()
+    if isinstance(obj, set):
+        return list(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 def _sanitize_for_csv_cell(value: str | None) -> str | None:
     """
@@ -169,11 +183,19 @@ def _ensure_mlebench_importable(data_dir: Path) -> None:
     candidates.append(data_dir.parent.parent)
     candidates.append(Path.home() / "mle-bench")
 
+    # In mlebench containers, mlebench is installed as editable at /mlebench
+    candidates.append(Path("/mlebench"))
+
     for root in candidates:
-        if (root / "mlebench" / "__init__.py").exists():
+        # Check for site-packages path (conda env) or repo root
+        if (root / "mlebench" / "__init__.py").exists() or (root.name == "site-packages" and (root / "mlebench").exists()):
             if str(root) not in sys.path:
                 sys.path.insert(0, str(root))
-            return
+            try:
+                import mlebench  # noqa: F401
+                return
+            except Exception:
+                pass
 
 
 def _filter_submission_to_private_answers(
@@ -575,7 +597,22 @@ def setup_per_step_grading(cfg, competition_id: str = None):
         return None
 
     data_dir = Path(cfg.per_step_grading.mlebench_data_dir)
-    if not data_dir.exists():
+
+    # In mlebench containers, only the specific competition path is mounted:
+    # /private/data/{competition_id}/prepared/private/
+    # Permission errors can occur when checking paths - handle gracefully
+    try:
+        competition_private_dir = data_dir / competition_id / "prepared" / "private"
+        dir_exists = competition_private_dir.exists() or data_dir.exists()
+    except PermissionError:
+        # Path exists but we can't stat it - proceed anyway, grading will fail gracefully if needed
+        logger.info(f"Permission check failed for {data_dir}, proceeding with grading setup")
+        dir_exists = True
+    except Exception as e:
+        logger.warning(f"Error checking MLE-bench data dir: {e}")
+        dir_exists = False
+
+    if not dir_exists:
         logger.warning(f"MLE-bench data dir not found: {data_dir}")
         return None
 
@@ -694,11 +731,11 @@ class GradingCallback:
     def _save_json_incremental(self) -> None:
         self._atomic_write_bytes(
             self.output_dir / "grading_history.json",
-            json.dumps(self.grading_history, indent=2).encode("utf-8"),
+            json.dumps(self.grading_history, indent=2, default=_json_default).encode("utf-8"),
         )
         self._atomic_write_bytes(
             self.output_dir / "buggy_node_history.json",
-            json.dumps(self.buggy_node_history, indent=2).encode("utf-8"),
+            json.dumps(self.buggy_node_history, indent=2, default=_json_default).encode("utf-8"),
         )
 
     def _save_csv_incremental(self) -> None:
@@ -826,6 +863,15 @@ class GradingCallback:
                     "cv_folds": None,
                     "test_score": None,
                     "test_percentile": None,
+                    "test_gold_medal": None,
+                    "test_silver_medal": None,
+                    "test_bronze_medal": None,
+                    "test_above_median": None,
+                    "test_gold_threshold": None,
+                    "test_silver_threshold": None,
+                    "test_bronze_threshold": None,
+                    "test_median_threshold": None,
+                    "test_is_lower_better": None,
                     "error": "No selection",
                 })
                 continue
@@ -917,14 +963,14 @@ class GradingCallback:
         # Save grading history JSON
         output_file = self.output_dir / "grading_history.json"
         with open(output_file, 'w') as f:
-            json.dump(self.grading_history, f, indent=2)
+            json.dump(self.grading_history, f, indent=2, default=_json_default)
 
         logger.info(f"[Per-step grading] Saved grading history to {output_file}")
 
         # Save buggy node history JSON
         buggy_output_file = self.output_dir / "buggy_node_history.json"
         with open(buggy_output_file, 'w') as f:
-            json.dump(self.buggy_node_history, f, indent=2)
+            json.dump(self.buggy_node_history, f, indent=2, default=_json_default)
 
         logger.info(f"[Per-step grading] Saved buggy node history to {buggy_output_file}")
         # CSVs are written incrementally during the run to support `tail -f`.
