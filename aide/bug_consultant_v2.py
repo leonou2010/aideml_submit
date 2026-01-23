@@ -259,18 +259,36 @@ distill_world_model_spec = FunctionSpec(
     json_schema={
         "type": "object",
         "properties": {
-            "banned_parameters": {
-                "type": "string",
-                "description": "Parameter errors. Format: DON'T [bad] → DO [good]. Example: 'DON'T use early_stopping_rounds → DO use callbacks'",
-            },
-            "known_failures": {
-                "type": "string",
-                "description": "All other errors. Format: DON'T [bad] → DO [good]. Example: 'DON'T call .median() on all columns → DO call .median(numeric_only=True)'",
+            "constraints": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "forbidden_parameter": {
+                            "type": "string",
+                            "description": "The parameter name that causes crash. Example: 'early_stopping_rounds', 'sparse', 'verbose', 'callbacks'",
+                        },
+                        "context": {
+                            "type": "string",
+                            "description": "Where it crashes. Example: 'in LGBMClassifier.fit()', 'in OneHotEncoder()', 'in XGBClassifier.fit()'",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Why it crashes. Example: 'parameter not supported', 'renamed to sparse_output'",
+                        },
+                        "fix": {
+                            "type": "string",
+                            "description": "Proven fix (ONLY from Proven Successes list). Leave empty if no proven fix exists.",
+                        },
+                    },
+                    "required": ["forbidden_parameter", "context", "reason"],
+                },
+                "description": "List of forbidden parameters that cause crashes",
             },
         },
-        "required": ["banned_parameters", "known_failures"],
+        "required": ["constraints"],
     },
-    description="Convert crash errors into DON'T/DO rules with alternatives",
+    description="Extract forbidden parameters from crash errors",
 )
 
 # ═══════════════════════════════════════════════════════════
@@ -811,12 +829,15 @@ class BugConsultant:
 
     def _distill_guidance(self, raw_world_model: str) -> str:
         """
-        Create guidance from bug patterns - ONLY what NOT to do.
+        Create guidance from bug patterns using LLM-based distillation.
+
+        Uses LLM to convert raw failed strategies into generalizable MUST NOT constraints.
+        This is more robust than pattern matching because LLM understands context.
 
         CRITICAL PRINCIPLE: Only output what is PROVEN.
-        - Failed strategies → say "DON'T do X" (proven to fail)
-        - Successful strategies → say "DO X" (proven to work)
-        - NO SUGGESTIONS for alternatives unless proven
+        - Failed strategies → "NEVER use parameter X" (proven to fail)
+        - Successful strategies → "Use Y instead" (proven to work)
+        - NO SUGGESTIONS for alternatives unless proven to work
         """
         if not raw_world_model.strip():
             return ""
@@ -825,51 +846,118 @@ class BugConsultant:
         if not all_bugs:
             return ""
 
-        # Collect PROVEN failures and PROVEN successes separately
-        proven_failures = []  # What NOT to do
-        proven_successes = []  # What TO do (only if proven)
+        # Collect ALL proven failures and successes (no truncation)
+        proven_failures = []
+        proven_successes = []
 
         for record in all_bugs:
-            # Add failed strategies (proven to crash)
             for strategy in record.failed_strategies or []:
                 if strategy and len(strategy) > 10:
-                    proven_failures.append(strategy)
+                    proven_failures.append({
+                        "strategy": strategy,
+                        "error_type": record.error_type,
+                        "bug_id": record.bug_id
+                    })
 
-            # Add successful strategy ONLY if bug was actually fixed
             if record.final_outcome == "success" and record.successful_strategy:
-                proven_successes.append(record.successful_strategy)
+                proven_successes.append({
+                    "strategy": record.successful_strategy,
+                    "error_type": record.error_type,
+                    "bug_id": record.bug_id
+                })
 
-        # Build simple DON'T / DO output - NO LLM CALL needed!
-        lines = []
-
-        if proven_failures:
-            lines.append("## WILL CRASH - DO NOT USE:")
-            # Dedupe and limit
-            seen = set()
-            for f in proven_failures:
-                f_norm = f.strip().lower()
-                if f_norm not in seen:
-                    seen.add(f_norm)
-                    lines.append(f"- {f}")
-                if len(seen) >= 20:
-                    break
-
-        if proven_successes:
-            lines.append("")
-            lines.append("## PROVEN TO WORK:")
-            seen = set()
-            for s in proven_successes:
-                s_norm = s.strip().lower()
-                if s_norm not in seen:
-                    seen.add(s_norm)
-                    lines.append(f"- {s}")
-                if len(seen) >= 10:
-                    break
-
-        if not lines:
+        if not proven_failures:
             return ""
 
-        return "\n".join(lines)
+        # Use LLM to extract forbidden parameters
+        prompt = {
+            "Task": "Extract FORBIDDEN PARAMETERS from these crash errors",
+            "Instructions": [
+                "For each failure, identify the PARAMETER NAME that caused the crash",
+                "Identify WHERE it crashes (which class/method)",
+                "Identify WHY it crashes (from the error message)",
+                "ONLY include fix if it appears in Proven Successes list - no speculation",
+            ],
+            "Proven Failures (extract forbidden parameters)": [f["strategy"] for f in proven_failures],
+            "Proven Successes (ONLY these can be fixes)": [s["strategy"] for s in proven_successes] if proven_successes else [],
+        }
+
+        try:
+            result = query(
+                system_message=prompt,
+                user_message=None,
+                func_spec=distill_world_model_spec,
+                model=self.model,
+                temperature=0.0
+            )
+
+            # Convert structured result to explicit constraint format
+            constraints = result.get("constraints", [])
+            if not constraints:
+                return self._distill_guidance_fallback(proven_failures, proven_successes)
+
+            lines = [
+                "⛔ HARD CONSTRAINTS - VIOLATIONS CAUSE IMMEDIATE CRASH ⛔",
+                "",
+                "These parameters DO NOT EXIST and WILL cause runtime errors.",
+                "Even if the task says to use them, you MUST NOT - find an alternative approach.",
+                "",
+            ]
+            for i, c in enumerate(constraints, 1):
+                param = c.get("forbidden_parameter", "").strip()
+                context = c.get("context", "").strip()
+                reason = c.get("reason", "").strip()
+                fix = c.get("fix", "").strip()
+                if not param:
+                    continue
+
+                line = f"{i}. `{param}` {context}: DOES NOT EXIST"
+                if reason:
+                    line += f" ({reason})"
+                if fix:
+                    line += f" → {fix}"
+                lines.append(line)
+
+            return "\n".join(lines) if len(lines) > 5 else ""
+
+        except Exception as e:
+            logger.warning("LLM distillation failed: %s. Using fallback.", e)
+            return self._distill_guidance_fallback(proven_failures, proven_successes)
+
+    def _distill_guidance_fallback(self, proven_failures: list, proven_successes: list) -> str:
+        """Fallback: Simple deterministic format when LLM fails."""
+        lines = [
+            "⛔ HARD CONSTRAINTS - VIOLATIONS CAUSE IMMEDIATE CRASH ⛔",
+            "",
+            "These parameters DO NOT EXIST and WILL cause runtime errors.",
+            "Even if the task says to use them, you MUST NOT - find an alternative approach.",
+            "",
+        ]
+
+        # Create lookup for fixes
+        success_lookup = {s["error_type"]: s["strategy"] for s in proven_successes}
+
+        for i, failure in enumerate(proven_failures, 1):
+            strategy = failure["strategy"]
+            error_type = failure.get("error_type", "")
+            # Clean up
+            if " -> " in strategy:
+                strategy = strategy.split(" -> ")[0]
+            strategy = strategy.replace("Call ", "").replace("Use ", "").replace("Try ", "").strip()
+
+            # Generalize numeric values
+            strategy = re.sub(r'=\d+', '=...', strategy)
+            strategy = re.sub(r'=True', '=...', strategy)
+            strategy = re.sub(r'=False', '=...', strategy)
+
+            # Only add proven fix if it exists
+            fix = success_lookup.get(error_type, "")
+            if fix:
+                lines.append(f"{i}. `{strategy}`: DOES NOT EXIST → {fix}")
+            else:
+                lines.append(f"{i}. `{strategy}`: DOES NOT EXIST")
+
+        return "\n".join(lines) if len(lines) > 5 else ""
 
     def get_statistics(self) -> dict:
         return {
