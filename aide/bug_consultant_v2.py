@@ -896,29 +896,55 @@ class BugConsultant:
             if not constraints:
                 return self._distill_guidance_fallback(proven_failures, proven_successes)
 
+            # Unique environment + updated docs framing
+            # LLMs are good at following documentation
+            num_crashes = len(proven_failures)
+
+            # Extract library names from constraints for specific warnings
+            libs_mentioned = set()
+            for c in constraints:
+                ctx = c.get("context", "").lower()
+                if "onehotencoder" in ctx or "sklearn" in ctx:
+                    libs_mentioned.add("sklearn")
+                if "lgbm" in ctx or "lightgbm" in ctx:
+                    libs_mentioned.add("lightgbm")
+                if "xgb" in ctx or "xgboost" in ctx:
+                    libs_mentioned.add("xgboost")
+
+            # Scary, creative, consequence-focused version
+            if not constraints:
+                return ""
+
             lines = [
-                "⛔ HARD CONSTRAINTS - VIOLATIONS CAUSE IMMEDIATE CRASH ⛔",
+                "╔═══════════════════════════════════════════════════════════════╗",
+                "║  🚨 CRITICAL: UPDATED ENVIRONMENT - MUST READ BEFORE CODING 🚨 ║",
+                "╚═══════════════════════════════════════════════════════════════╝",
                 "",
-                "These parameters DO NOT EXIST and WILL cause runtime errors.",
-                "Even if the task says to use them, you MUST NOT - find an alternative approach.",
+                "This is a NEW execution environment with UPDATED library versions.",
+                "Your training data about these APIs is WRONG. Follow this document.",
                 "",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "REMOVED PARAMETERS — TypeError crash if used:",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
             ]
-            for i, c in enumerate(constraints, 1):
-                param = c.get("forbidden_parameter", "").strip()
-                context = c.get("context", "").strip()
-                reason = c.get("reason", "").strip()
-                fix = c.get("fix", "").strip()
-                if not param:
-                    continue
 
-                line = f"{i}. `{param}` {context}: DOES NOT EXIST"
-                if reason:
-                    line += f" ({reason})"
-                if fix:
-                    line += f" → {fix}"
-                lines.append(line)
+            for c in constraints:
+                param = c.get("forbidden_parameter", "")
+                ctx = c.get("context", "")
+                reason = c.get("reason", "removed")
+                if param and ctx:
+                    lines.append(f"• {param}= {ctx}")
+                    lines.append(f"  ↳ Status: REMOVED — {reason}")
+                    lines.append("")
 
-            return "\n".join(lines) if len(lines) > 5 else ""
+            lines.extend([
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "⛔ DO NOT USE THESE PARAMETERS. THEY DO NOT EXIST.",
+                "⛔ Your code WILL crash with TypeError if you use them.",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            ])
+
+            return "\n".join(lines)
 
         except Exception as e:
             logger.warning("LLM distillation failed: %s. Using fallback.", e)
@@ -926,38 +952,20 @@ class BugConsultant:
 
     def _distill_guidance_fallback(self, proven_failures: list, proven_successes: list) -> str:
         """Fallback: Simple deterministic format when LLM fails."""
-        lines = [
-            "⛔ HARD CONSTRAINTS - VIOLATIONS CAUSE IMMEDIATE CRASH ⛔",
-            "",
-            "These parameters DO NOT EXIST and WILL cause runtime errors.",
-            "Even if the task says to use them, you MUST NOT - find an alternative approach.",
-            "",
-        ]
+        lines = ["```python", "# TypeError will be raised if you use:"]
 
-        # Create lookup for fixes
-        success_lookup = {s["error_type"]: s["strategy"] for s in proven_successes}
-
-        for i, failure in enumerate(proven_failures, 1):
+        for failure in proven_failures:
             strategy = failure["strategy"]
-            error_type = failure.get("error_type", "")
-            # Clean up
             if " -> " in strategy:
                 strategy = strategy.split(" -> ")[0]
             strategy = strategy.replace("Call ", "").replace("Use ", "").replace("Try ", "").strip()
-
-            # Generalize numeric values
             strategy = re.sub(r'=\d+', '=...', strategy)
             strategy = re.sub(r'=True', '=...', strategy)
             strategy = re.sub(r'=False', '=...', strategy)
+            lines.append(f"# {strategy}  # REMOVED")
+        lines.append("```")
 
-            # Only add proven fix if it exists
-            fix = success_lookup.get(error_type, "")
-            if fix:
-                lines.append(f"{i}. `{strategy}`: DOES NOT EXIST → {fix}")
-            else:
-                lines.append(f"{i}. `{strategy}`: DOES NOT EXIST")
-
-        return "\n".join(lines) if len(lines) > 5 else ""
+        return "\n".join(lines) if len(lines) > 3 else ""
 
     def get_statistics(self) -> dict:
         return {
