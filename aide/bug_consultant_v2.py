@@ -706,8 +706,15 @@ class BugConsultant:
         - Simple "BANNED:" prefix for failed approaches
         - "PROVEN FIX:" only for bugs that were successfully fixed
         """
+        # V5: Early stopping guidance (always include)
+        early_stopping = (
+            "PROVEN FIX:\n"
+            "- LightGBM early stopping: callbacks=[lgb.early_stopping(stopping_rounds=50)]\n"
+            "- XGBoost early stopping: callbacks=[xgb.callback.EarlyStopping(rounds=50)]"
+        )
+
         if not retrieval_result.get("selected_bugs"):
-            return ""
+            return early_stopping
 
         lines = []
 
@@ -731,6 +738,10 @@ class BugConsultant:
             lines.append("BANNED (will crash):")
             for item in banned_items:
                 lines.append(f"- {item}")
+
+        # V5: Always include early stopping as proven fix
+        proven_fixes.append("LightGBM early stopping: callbacks=[lgb.early_stopping(stopping_rounds=50)]")
+        proven_fixes.append("XGBoost early stopping: callbacks=[xgb.callback.EarlyStopping(rounds=50)]")
 
         # V4: Only show PROVEN FIX if bug was successfully fixed
         if proven_fixes:
@@ -781,8 +792,15 @@ class BugConsultant:
         Uses LLM to convert verbose bug summaries into actionable code patterns.
         Caches result until bug content actually changes (content-hash based).
         """
+        # V5: Always include early stopping guidance even when no bugs yet
+        early_stopping_guidance = (
+            "BANNED PARAMETERS:\n"
+            "- early_stopping_rounds= parameter (LightGBM/XGBoost)\n"
+            "  PROVEN FIX: LightGBM: callbacks=[lgb.early_stopping(stopping_rounds=50)], XGBoost: callbacks=[xgb.callback.EarlyStopping(rounds=50)]"
+        )
+
         if not self.bug_records and not self.active_bugs:
-            return ""
+            return early_stopping_guidance
 
         # Get raw world model content
         raw_content = self._render_world_model(journal=journal)
@@ -928,6 +946,10 @@ class BugConsultant:
                     if fix:
                         lines.append(f"  PROVEN FIX: {fix}")
 
+            # V5: Always include early stopping guidance (proven fix from V4 analysis)
+            lines.append("- early_stopping_rounds= parameter (LightGBM/XGBoost)")
+            lines.append("  PROVEN FIX: LightGBM: callbacks=[lgb.early_stopping(stopping_rounds=50)], XGBoost: callbacks=[xgb.callback.EarlyStopping(rounds=50)]")
+
             return "\n".join(lines)
 
         except Exception as e:
@@ -947,6 +969,10 @@ class BugConsultant:
             strategy = re.sub(r'=True', '=...', strategy)
             strategy = re.sub(r'=False', '=...', strategy)
             lines.append(f"- {strategy}")
+
+        # V5: Always include early stopping guidance (proven fix from V4 analysis)
+        lines.append("- early_stopping_rounds= parameter (LightGBM/XGBoost)")
+        lines.append("  PROVEN FIX: LightGBM: callbacks=[lgb.early_stopping(stopping_rounds=50)], XGBoost: callbacks=[xgb.callback.EarlyStopping(rounds=50)]")
 
         return "\n".join(lines) if len(lines) > 1 else ""
 

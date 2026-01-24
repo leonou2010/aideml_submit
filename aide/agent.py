@@ -239,6 +239,7 @@ class Agent:
             "Your response should only contain a single code block.",
             f"Be aware of the running time of the code, it should complete within {humanize.naturaldelta(self.cfg.exec.timeout)}.",
             "DO NOT use GridSearchCV or RandomizedSearchCV.",
+            "**Early Stopping**: When using LightGBM or XGBoost, use the callbacks API: `model.fit(..., callbacks=[lgb.early_stopping(stopping_rounds=50)])` for LightGBM or `callbacks=[xgb.callback.EarlyStopping(rounds=50)]` for XGBoost. Do NOT use `early_stopping_rounds=` parameter directly.",
             "Compute safety: avoid unconstrained parallelism. Do NOT use `n_jobs=-1` anywhere. If you set `n_jobs` / `thread_count` / `num_threads`, cap them to `int(os.getenv('AIDE_NUM_THREADS', '{n}'))` (use the same cap consistently).".format(
                 n=int(getattr(self.cfg.exec, "num_threads", 4) or 4)
             ),
