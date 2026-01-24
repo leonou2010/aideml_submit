@@ -702,50 +702,42 @@ class BugConsultant:
     def format_context_for_actor(self, retrieval_result: dict) -> str:
         """Format historical context using ONLY evidence-based information.
 
-        CRITICAL: No LLM call here - LLM was inventing suggestions that hadn't been proven.
-        Only include information that is actually recorded in bug records.
+        V4: Plain format (86% success vs 31% scary format in ablation tests)
+        - Simple "BANNED:" prefix for failed approaches
+        - "PROVEN FIX:" only for bugs that were successfully fixed
         """
         if not retrieval_result.get("selected_bugs"):
-            return "No relevant historical bugs found."
+            return ""
 
-        lines = ["# Historical Bug Context (Similar bugs to yours)", ""]
+        lines = []
 
-        # FAILED FIRST - most important to avoid repeating
-        lines.append("## WILL CRASH - NEVER USE THESE (already failed, will fail again)")
-        has_failures = False
+        # V4: Collect all failed strategies AND original error signatures
+        banned_items = []
         for r in retrieval_result["selected_bugs"]:
             if r.failed_strategies:
-                has_failures = True
                 for strategy in r.failed_strategies:
-                    lines.append(f"- {strategy}")
-        if not has_failures:
-            lines.append("- (no recorded failures yet)")
-        lines.append("")
+                    banned_items.append(strategy)
+            elif r.error_signature:  # Bug crashed but no debug trial yet
+                banned_items.append(r.error_signature)
 
-        # What Worked - ONLY from actual successful_strategy fields
-        lines.append("## USE THESE APPROACHES (proven to work)")
-        worked = [r for r in retrieval_result["selected_bugs"] if r.successful_strategy]
-        if worked:
-            for r in worked:
-                lines.append(f"- RECOMMENDED: {r.successful_strategy}")
-        else:
-            lines.append("- (no proven fixes yet - find a NEW approach different from failed ones)")
-        lines.append("")
+        # V4: Collect proven fixes (only from successfully debugged bugs)
+        proven_fixes = []
+        for r in retrieval_result["selected_bugs"]:
+            if r.final_outcome == "success" and r.successful_strategy:
+                proven_fixes.append(r.successful_strategy)
 
-        # Lessons
-        lessons = [r for r in retrieval_result["selected_bugs"] if r.lesson]
-        if lessons:
-            lines.append("## Lessons Learned")
-            for r in lessons:
-                lines.append(f"- {r.lesson}")
+        # V4: Plain format - BANNED first
+        if banned_items:
+            lines.append("BANNED (will crash):")
+            for item in banned_items:
+                lines.append(f"- {item}")
+
+        # V4: Only show PROVEN FIX if bug was successfully fixed
+        if proven_fixes:
             lines.append("")
-
-        # Key patterns from retrieval (from the retrieval LLM, which is OK)
-        if retrieval_result.get("key_patterns"):
-            lines.append("## Key Patterns")
-            for pattern in retrieval_result["key_patterns"]:
-                lines.append(f"- {pattern}")
-            lines.append("")
+            lines.append("PROVEN FIX:")
+            for fix in proven_fixes:
+                lines.append(f"- {fix}")
 
         result = "\n".join(lines)
 
@@ -851,13 +843,22 @@ class BugConsultant:
         proven_successes = []
 
         for record in all_bugs:
-            for strategy in record.failed_strategies or []:
-                if strategy and len(strategy) > 10:
-                    proven_failures.append({
-                        "strategy": strategy,
-                        "error_type": record.error_type,
-                        "bug_id": record.bug_id
-                    })
+            # Include failed debug strategies
+            if record.failed_strategies:
+                for strategy in record.failed_strategies:
+                    if strategy and len(strategy) > 10:
+                        proven_failures.append({
+                            "strategy": strategy,
+                            "error_type": record.error_type,
+                            "bug_id": record.bug_id
+                        })
+            # Also include original error signature for bugs with no debug trials yet
+            elif record.error_signature:
+                proven_failures.append({
+                    "strategy": record.error_signature,
+                    "error_type": record.error_type,
+                    "bug_id": record.bug_id
+                })
 
             if record.final_outcome == "success" and record.successful_strategy:
                 proven_successes.append({
