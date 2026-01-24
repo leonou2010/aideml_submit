@@ -911,38 +911,21 @@ class BugConsultant:
                 if "xgb" in ctx or "xgboost" in ctx:
                     libs_mentioned.add("xgboost")
 
-            # Scary, creative, consequence-focused version
+            # V4: Plain format (86% success) - no scary boxes/emojis
             if not constraints:
                 return ""
 
-            lines = [
-                "╔═══════════════════════════════════════════════════════════════╗",
-                "║  🚨 CRITICAL: UPDATED ENVIRONMENT - MUST READ BEFORE CODING 🚨 ║",
-                "╚═══════════════════════════════════════════════════════════════╝",
-                "",
-                "This is a NEW execution environment with UPDATED library versions.",
-                "Your training data about these APIs is WRONG. Follow this document.",
-                "",
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                "REMOVED PARAMETERS — TypeError crash if used:",
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            ]
+            lines = ["BANNED PARAMETERS:"]
 
             for c in constraints:
                 param = c.get("forbidden_parameter", "")
                 ctx = c.get("context", "")
-                reason = c.get("reason", "removed")
+                fix = c.get("fix", "")  # Only present if bug was COMPLETED (successfully debugged)
                 if param and ctx:
-                    lines.append(f"• {param}= {ctx}")
-                    lines.append(f"  ↳ Status: REMOVED — {reason}")
-                    lines.append("")
-
-            lines.extend([
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                "⛔ DO NOT USE THESE PARAMETERS. THEY DO NOT EXIST.",
-                "⛔ Your code WILL crash with TypeError if you use them.",
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            ])
+                    lines.append(f"- {param} {ctx}")
+                    # V4 Change 4: Only show PROVEN FIX when fix exists (bug was successfully fixed)
+                    if fix:
+                        lines.append(f"  PROVEN FIX: {fix}")
 
             return "\n".join(lines)
 
@@ -951,8 +934,8 @@ class BugConsultant:
             return self._distill_guidance_fallback(proven_failures, proven_successes)
 
     def _distill_guidance_fallback(self, proven_failures: list, proven_successes: list) -> str:
-        """Fallback: Simple deterministic format when LLM fails."""
-        lines = ["```python", "# TypeError will be raised if you use:"]
+        """Fallback: Simple deterministic format when LLM fails. V4: Plain format."""
+        lines = ["BANNED PARAMETERS:"]
 
         for failure in proven_failures:
             strategy = failure["strategy"]
@@ -962,10 +945,9 @@ class BugConsultant:
             strategy = re.sub(r'=\d+', '=...', strategy)
             strategy = re.sub(r'=True', '=...', strategy)
             strategy = re.sub(r'=False', '=...', strategy)
-            lines.append(f"# {strategy}  # REMOVED")
-        lines.append("```")
+            lines.append(f"- {strategy}")
 
-        return "\n".join(lines) if len(lines) > 3 else ""
+        return "\n".join(lines) if len(lines) > 1 else ""
 
     def get_statistics(self) -> dict:
         return {

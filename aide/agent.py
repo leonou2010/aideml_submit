@@ -85,6 +85,25 @@ class Agent:
             lines.append(f"Output:\n```\n{out}\n```")
         return "\n\n".join(lines)
 
+    def _is_dead_bug(self, node: Node) -> bool:
+        """
+        V4: Detect "dead bugs" that have 0% debug success rate.
+        These are quick crashes with no traceback - nothing to debug.
+        Skip debugging and draft fresh instead.
+        """
+        # If there's an exception type, we have something to debug
+        if node.exc_type is not None:
+            return False
+        # If execution took more than 5 seconds, something ran
+        if node.exec_time is not None and node.exec_time >= 5:
+            return False
+        # If there's substantial output, we have something to work with
+        term_out = node.term_out or ""
+        if len(term_out) > 100:
+            return False
+        # Dead bug: no exception, quick crash, minimal output
+        return True
+
     def _buggy_nodes_for_memory(self, *, exclude_step: int | None = None) -> list[str]:
         """
         Return formatted buggy nodes for prompt memory.
@@ -433,17 +452,17 @@ class Agent:
                 "Your response should be an implementation outline in natural language,"
                 " followed by a single markdown code block which implements the bugfix/solution."
             ),
-            "Task description": self.task_desc,
-            "Approved Solution Plan": parent_node.plan or "",
-            "Previous (buggy) implementation": wrap_code(parent_node.code),
-            "Execution output": wrap_code(parent_node.term_out, lang=""),
-            "Instructions": {},
         }
-        if stage_section:
-            prompt["Stage Instructions"] = stage_section
-        # Debug gets RAG context (specific to this bug type), not general prevention
+        # V4: Move Bug Context to TOP of prompt for better visibility
         if debug_history and bug_context_mode in ("consultant", "both"):
             prompt["Historical Bug Context (Curated)"] = debug_history
+        prompt["Task description"] = self.task_desc
+        prompt["Approved Solution Plan"] = parent_node.plan or ""
+        prompt["Previous (buggy) implementation"] = wrap_code(parent_node.code)
+        prompt["Execution output"] = wrap_code(parent_node.term_out, lang="")
+        prompt["Instructions"] = {}
+        if stage_section:
+            prompt["Stage Instructions"] = stage_section
         if active_trials:
             prompt["Current Bug Trial History"] = active_trials
         if past_buggy_nodes:
@@ -462,8 +481,9 @@ class Agent:
         prompt["Instructions"] |= {"Bugfix improvement sketch guideline": bugfix_guideline}
         prompt["Instructions"] |= {
             "Plan adherence": [
-                "Honor the Approved Solution Plan above; fix the bug without changing the planned approach unless absolutely necessary.",
-                "Do not add or delete planned features/models/training strategies; focus on the minimal fix.",
+                "Honor the IDEA of the Approved Solution Plan (model choice, CV strategy, feature approach)",
+                "Implementation DETAILS (API calls, parameter names) CAN change to avoid bugs",
+                "Example: Plan says 'early stopping' → choose a working implementation (e.g., remove the feature or use alternative method)",
             ],
         }
         prompt["Instructions"] |= self._prompt_impl_guideline
@@ -527,7 +547,12 @@ class Agent:
         if parent_node is None:
             result_node = self._draft()
         elif parent_node.is_buggy:
-            result_node = self._debug(parent_node)
+            # V4: Skip debugging for "dead bugs" - no traceback, quick crash, nothing to debug
+            if self._is_dead_bug(parent_node):
+                logger.info("Skipping debug for dead bug (no traceback, quick crash) - drafting instead")
+                result_node = self._draft()
+            else:
+                result_node = self._debug(parent_node)
         else:
             result_node = self._improve(parent_node)
 
