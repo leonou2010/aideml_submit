@@ -259,36 +259,32 @@ distill_world_model_spec = FunctionSpec(
     json_schema={
         "type": "object",
         "properties": {
-            "constraints": {
+            "patterns": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "forbidden_parameter": {
+                        "pattern": {
                             "type": "string",
-                            "description": "The parameter name that causes crash. Example: 'early_stopping_rounds', 'sparse', 'verbose', 'callbacks'",
+                            "description": "The banned pattern as text description. Example: \"'sparse' parameter in OneHotEncoder\", \"'verbose' parameter in LGBMClassifier.fit()\", \"'callbacks' parameter in XGBClassifier.fit()\"",
                         },
-                        "context": {
+                        "error_type": {
                             "type": "string",
-                            "description": "Where it crashes. Example: 'in LGBMClassifier.fit()', 'in OneHotEncoder()', 'in XGBClassifier.fit()'",
+                            "description": "The error type. Example: 'TypeError', 'ValueError'",
                         },
-                        "reason": {
+                        "fix_syntax": {
                             "type": "string",
-                            "description": "Why it crashes. Example: 'parameter not supported', 'renamed to sparse_output'",
-                        },
-                        "fix": {
-                            "type": "string",
-                            "description": "Proven fix (ONLY from Proven Successes list). Leave empty if no proven fix exists.",
+                            "description": "Proven fix as SHORT code syntax (ONLY from Proven Successes list). Example: 'sparse_output=False', 'callbacks=[lgb.log_evaluation()]'. Leave empty if no proven fix exists.",
                         },
                     },
-                    "required": ["forbidden_parameter", "context", "reason"],
+                    "required": ["pattern", "error_type"],
                 },
-                "description": "List of forbidden parameters that cause crashes",
+                "description": "List of banned code patterns that cause crashes",
             },
         },
-        "required": ["constraints"],
+        "required": ["patterns"],
     },
-    description="Extract forbidden parameters from crash errors",
+    description="Extract banned code patterns from crash errors",
 )
 
 # ═══════════════════════════════════════════════════════════
@@ -709,8 +705,8 @@ class BugConsultant:
         # V5: Early stopping guidance (always include)
         early_stopping = (
             "PROVEN FIX:\n"
-            "- LightGBM early stopping: callbacks=[lgb.early_stopping(stopping_rounds=50)]\n"
-            "- XGBoost early stopping: callbacks=[xgb.callback.EarlyStopping(rounds=50)]"
+            "- LightGBM early stopping: callbacks=[lgb.early_stopping(stopping_rounds=N)]\n"
+            "- XGBoost early stopping: xgboost.train(params, dtrain, evals=[(dval, 'val')], early_stopping_rounds=N)"
         )
 
         if not retrieval_result.get("selected_bugs"):
@@ -727,6 +723,10 @@ class BugConsultant:
             elif r.error_signature:  # Bug crashed but no debug trial yet
                 banned_items.append(r.error_signature)
 
+        # V5: Always include banned early stopping patterns (debug context needs this too)
+        banned_items.append("'early_stopping_rounds' in LGBMClassifier.fit() / LGBMRegressor.fit() / lgb.train()")
+        banned_items.append("'early_stopping_rounds' or 'callbacks' in XGBClassifier.fit() / XGBRegressor.fit()")
+
         # V4: Collect proven fixes (only from successfully debugged bugs)
         proven_fixes = []
         for r in retrieval_result["selected_bugs"]:
@@ -740,8 +740,8 @@ class BugConsultant:
                 lines.append(f"- {item}")
 
         # V5: Always include early stopping as proven fix
-        proven_fixes.append("LightGBM early stopping: callbacks=[lgb.early_stopping(stopping_rounds=50)]")
-        proven_fixes.append("XGBoost early stopping: callbacks=[xgb.callback.EarlyStopping(rounds=50)]")
+        proven_fixes.append("LightGBM early stopping: callbacks=[lgb.early_stopping(stopping_rounds=N)]")
+        proven_fixes.append("XGBoost early stopping: xgboost.train(params, dtrain, evals=[(dval, 'val')], early_stopping_rounds=N)")
 
         # V4: Only show PROVEN FIX if bug was successfully fixed
         if proven_fixes:
@@ -794,9 +794,11 @@ class BugConsultant:
         """
         # V5: Always include early stopping guidance even when no bugs yet
         early_stopping_guidance = (
-            "BANNED PARAMETERS:\n"
-            "- early_stopping_rounds= parameter (LightGBM/XGBoost)\n"
-            "  PROVEN FIX: LightGBM: callbacks=[lgb.early_stopping(stopping_rounds=50)], XGBoost: callbacks=[xgb.callback.EarlyStopping(rounds=50)]"
+            "BANNED:\n"
+            "- 'early_stopping_rounds' parameter in LGBMClassifier.fit() / LGBMRegressor.fit() / lgb.train() (causes TypeError)\n"
+            "  USE: callbacks=[lgb.early_stopping(stopping_rounds=N)]\n"
+            "- 'early_stopping_rounds' or 'callbacks' in XGBClassifier.fit() / XGBRegressor.fit() (causes TypeError)\n"
+            "  USE: xgboost.train(params, dtrain, evals=[(dval, 'val')], early_stopping_rounds=N)"
         )
 
         if not self.bug_records and not self.active_bugs:
@@ -888,17 +890,17 @@ class BugConsultant:
         if not proven_failures:
             return ""
 
-        # Use LLM to extract forbidden parameters
+        # Use LLM to extract banned patterns
         prompt = {
-            "Task": "Extract FORBIDDEN PARAMETERS from these crash errors",
+            "Task": "Extract BANNED PATTERNS from these crash errors",
             "Instructions": [
-                "For each failure, identify the PARAMETER NAME that caused the crash",
-                "Identify WHERE it crashes (which class/method)",
-                "Identify WHY it crashes (from the error message)",
-                "ONLY include fix if it appears in Proven Successes list - no speculation",
+                "For each failure, describe the banned pattern as text (e.g., \"'sparse' parameter in OneHotEncoder\")",
+                "Include the error type (TypeError, ValueError, etc.)",
+                "ONLY include fix_syntax if it appears in Proven Successes list - no speculation",
+                "fix_syntax should be SHORT code syntax (e.g., 'sparse_output=False')",
             ],
-            "Proven Failures (extract forbidden parameters)": [f["strategy"] for f in proven_failures],
-            "Proven Successes (ONLY these can be fixes)": [s["strategy"] for s in proven_successes] if proven_successes else [],
+            "Proven Failures (extract banned patterns)": [f["strategy"] for f in proven_failures],
+            "Proven Successes (ONLY these can be fix_syntax)": [s["strategy"] for s in proven_successes] if proven_successes else [],
         }
 
         try:
@@ -910,45 +912,37 @@ class BugConsultant:
                 temperature=0.0
             )
 
-            # Convert structured result to explicit constraint format
-            constraints = result.get("constraints", [])
-            if not constraints:
+            # V5: Convert structured result to pattern-based format
+            patterns = result.get("patterns", [])
+            if not patterns:
                 return self._distill_guidance_fallback(proven_failures, proven_successes)
 
-            # Unique environment + updated docs framing
-            # LLMs are good at following documentation
-            num_crashes = len(proven_failures)
+            # V5: New format - "BANNED:" with pattern description and error type
+            # Format: - 'sparse' parameter in OneHotEncoder (causes TypeError)
+            #           USE: sparse_output=False
+            lines = ["BANNED:"]
 
-            # Extract library names from constraints for specific warnings
-            libs_mentioned = set()
-            for c in constraints:
-                ctx = c.get("context", "").lower()
-                if "onehotencoder" in ctx or "sklearn" in ctx:
-                    libs_mentioned.add("sklearn")
-                if "lgbm" in ctx or "lightgbm" in ctx:
-                    libs_mentioned.add("lightgbm")
-                if "xgb" in ctx or "xgboost" in ctx:
-                    libs_mentioned.add("xgboost")
+            for p in patterns:
+                pattern = p.get("pattern", "")
+                error_type = p.get("error_type", "")
+                fix_syntax = p.get("fix_syntax", "")  # Only from proven successes
 
-            # V4: Plain format (86% success) - no scary boxes/emojis
-            if not constraints:
-                return ""
+                if pattern:
+                    # Format: pattern (causes ErrorType)
+                    if error_type:
+                        lines.append(f"- {pattern} (causes {error_type})")
+                    else:
+                        lines.append(f"- {pattern}")
 
-            lines = ["BANNED PARAMETERS:"]
+                    # Only show USE: if proven fix exists
+                    if fix_syntax:
+                        lines.append(f"  USE: {fix_syntax}")
 
-            for c in constraints:
-                param = c.get("forbidden_parameter", "")
-                ctx = c.get("context", "")
-                fix = c.get("fix", "")  # Only present if bug was COMPLETED (successfully debugged)
-                if param and ctx:
-                    lines.append(f"- {param} {ctx}")
-                    # V4 Change 4: Only show PROVEN FIX when fix exists (bug was successfully fixed)
-                    if fix:
-                        lines.append(f"  PROVEN FIX: {fix}")
-
-            # V5: Always include early stopping guidance (proven fix from V4 analysis)
-            lines.append("- early_stopping_rounds= parameter (LightGBM/XGBoost)")
-            lines.append("  PROVEN FIX: LightGBM: callbacks=[lgb.early_stopping(stopping_rounds=50)], XGBoost: callbacks=[xgb.callback.EarlyStopping(rounds=50)]")
+            # V5: Always include early stopping guidance (proven fix)
+            lines.append("- 'early_stopping_rounds' parameter in LGBMClassifier.fit() / LGBMRegressor.fit() / lgb.train() (causes TypeError)")
+            lines.append("  USE: callbacks=[lgb.early_stopping(stopping_rounds=N)]")
+            lines.append("- 'early_stopping_rounds' or 'callbacks' in XGBClassifier.fit() / XGBRegressor.fit() (causes TypeError)")
+            lines.append("  USE: xgboost.train(params, dtrain, evals=[(dval, 'val')], early_stopping_rounds=N)")
 
             return "\n".join(lines)
 
@@ -957,22 +951,28 @@ class BugConsultant:
             return self._distill_guidance_fallback(proven_failures, proven_successes)
 
     def _distill_guidance_fallback(self, proven_failures: list, proven_successes: list) -> str:
-        """Fallback: Simple deterministic format when LLM fails. V4: Plain format."""
-        lines = ["BANNED PARAMETERS:"]
+        """Fallback: Simple deterministic format when LLM fails. V5: Pattern-based format."""
+        lines = ["BANNED:"]
 
         for failure in proven_failures:
             strategy = failure["strategy"]
+            error_type = failure.get("error_type", "")
             if " -> " in strategy:
                 strategy = strategy.split(" -> ")[0]
             strategy = strategy.replace("Call ", "").replace("Use ", "").replace("Try ", "").strip()
             strategy = re.sub(r'=\d+', '=...', strategy)
             strategy = re.sub(r'=True', '=...', strategy)
             strategy = re.sub(r'=False', '=...', strategy)
-            lines.append(f"- {strategy}")
+            if error_type:
+                lines.append(f"- {strategy} (causes {error_type})")
+            else:
+                lines.append(f"- {strategy}")
 
-        # V5: Always include early stopping guidance (proven fix from V4 analysis)
-        lines.append("- early_stopping_rounds= parameter (LightGBM/XGBoost)")
-        lines.append("  PROVEN FIX: LightGBM: callbacks=[lgb.early_stopping(stopping_rounds=50)], XGBoost: callbacks=[xgb.callback.EarlyStopping(rounds=50)]")
+        # V5: Always include early stopping guidance (proven fix)
+        lines.append("- 'early_stopping_rounds' parameter in LGBMClassifier.fit() / LGBMRegressor.fit() / lgb.train() (causes TypeError)")
+        lines.append("  USE: callbacks=[lgb.early_stopping(stopping_rounds=N)]")
+        lines.append("- 'early_stopping_rounds' or 'callbacks' in XGBClassifier.fit() / XGBRegressor.fit() (causes TypeError)")
+        lines.append("  USE: xgboost.train(params, dtrain, evals=[(dval, 'val')], early_stopping_rounds=N)")
 
         return "\n".join(lines) if len(lines) > 1 else ""
 
